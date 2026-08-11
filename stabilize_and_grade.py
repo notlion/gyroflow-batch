@@ -452,14 +452,17 @@ def run_one(src, args, out_block, inter_preset, work):
         ffmpeg_cmd += ["-metadata", f"comment={comment}"] if comment else []
         ffmpeg_cmd += [str(path)]
 
-    if args.mode == "file":
-        gf_filename = f"{stem}.{RUN_ID}.mov"
-        pipe_path = work / gf_filename
-    else:
-        gf_filename = f"{stem}.{RUN_ID}.mkv"
-        pipe_path = work / f"{gf_filename}.tmp"   # Gyroflow writes to <name>.tmp
+    # Gyroflow renders to "<output_filename>.tmp" and renames only once it has
+    # finished, so both names have to be tracked in both modes. Miss the .tmp and
+    # an interrupted --mode file run strands a full-size intermediate -- upwards
+    # of 100 GB per clip that nothing else will ever clean up.
+    gf_filename = f"{stem}.{RUN_ID}." + ("mov" if args.mode == "file" else "mkv")
+    gf_final = work / gf_filename
+    gf_tmp = work / f"{gf_filename}.tmp"
 
-    ffmpeg_cmd[ffmpeg_cmd.index(None)] = str(pipe_path)
+    # File mode hands ffmpeg the finished render; pipe mode hands it the FIFO,
+    # which lives at the .tmp name because that is what Gyroflow opens.
+    ffmpeg_cmd[ffmpeg_cmd.index(None)] = str(gf_final if args.mode == "file" else gf_tmp)
 
     out_params = make_out_params(out_block, work, gf_filename, args.prores)
     # --stdout-progress gives us parseable progress lines. Its own bar would fight
@@ -472,8 +475,7 @@ def run_one(src, args, out_block, inter_preset, work):
         print(f"  ffmpeg:   {shlex.join(ffmpeg_cmd)}")
         return "skipped"
 
-    renamed = work / gf_filename
-    for leftover in (pipe_path, renamed):
+    for leftover in (gf_tmp, gf_final):
         leftover.unlink(missing_ok=True)
 
     fflog = work / f"{stem}.{RUN_ID}.ffmpeg.log"
@@ -491,7 +493,7 @@ def run_one(src, args, out_block, inter_preset, work):
             with fflog.open("wb") as log:
                 ff_rc = subprocess.run(ffmpeg_cmd, stdout=log, stderr=log).returncode
         else:
-            os.mkfifo(pipe_path)
+            os.mkfifo(gf_tmp)
             # Reader first: opening a FIFO blocks until the other end shows up.
             with fflog.open("wb") as log:
                 ff = subprocess.Popen(ffmpeg_cmd, stdout=log, stderr=log)
@@ -523,7 +525,7 @@ def run_one(src, args, out_block, inter_preset, work):
             path.unlink(missing_ok=True)
         raise
     finally:
-        for leftover in (pipe_path, renamed, fflog, gflog):
+        for leftover in (gf_tmp, gf_final, fflog, gflog):
             try:
                 leftover.unlink(missing_ok=True)
             except OSError:
