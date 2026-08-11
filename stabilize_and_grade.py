@@ -568,7 +568,9 @@ def main():
     p.add_argument("--lut", type=Path, default=None,
                    help="default: the only .cube file in --src-dir")
     p.add_argument("--gyroflow", type=Path,
-                   default=Path("/Applications/Gyroflow.app/Contents/MacOS/gyroflow"))
+                   default=Path("/Applications/Gyroflow.app/Contents/MacOS/gyroflow"),
+                   help="the Gyroflow CLI binary inside the app bundle "
+                        "(default: %(default)s)")
     p.add_argument("--work", type=Path, default=None,
                    help="where the pipe and derived preset live; must support FIFOs "
                         "(exFAT and most network shares do not). "
@@ -585,8 +587,13 @@ def main():
                         "the graded one by default")
     p.add_argument("--mode", default="pipe", choices=["pipe", "file"],
                    help="'file' writes a real ProRes intermediate (needs ~100 GB/clip)")
-    p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--overwrite", action="store_true",
+                   help="re-render deliveries that already exist. Without it each of the "
+                        "two is skipped on its own, and the check is existence only — a "
+                        "truncated file from an interrupted run still counts as done")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the derived plan and the exact gyroflow and ffmpeg "
+                        "commands, then exit without rendering anything")
     p.add_argument("--verbose", action="store_true",
                    help="let Gyroflow's log through to the terminal instead of a file; "
                         "it will tear through its own progress bar")
