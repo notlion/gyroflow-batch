@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS — ._* are the AppleDouble stubs external volumes litter everywhere
+.DS_Store
+._*
+
+# Script output, in case it is run with --src-dir left at its default (here)
+.gyroflow-work/
+Stabilized/
