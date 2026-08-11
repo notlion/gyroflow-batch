@@ -504,6 +504,14 @@ def run_one(src, args, out_block, inter_preset, work):
                     dump_log(gflog, "gyroflow")
                     gyroflow_failure_hint(gf_rc)
                     ff.send_signal(signal.SIGTERM)
+                    # If Gyroflow died before opening its end, ffmpeg is still
+                    # blocked in open() on the FIFO and can sit through SIGTERM.
+                    # Escalate instead of waiting on a writer that is not coming.
+                    try:
+                        ff.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        warn("encoder did not stop; killing it")
+                        ff.kill()
                 ff_rc = ff.wait()
 
         elapsed = fmt_duration(time.monotonic() - started)
@@ -537,7 +545,17 @@ def run_one(src, args, out_block, inter_preset, work):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Gyroflow stabilization + LUT grade in a single delivery encode.")
+        description="Gyroflow stabilization + LUT grade in a single delivery encode.",
+        # Shown whenever --src-dir is missing, which includes running with no
+        # arguments at all -- so this doubles as the getting-started text.
+        epilog='examples:\n'
+               '  %(prog)s --src-dir "/Volumes/Footage/Race Day" --dry-run\n'
+               '      show the derived plan without touching anything\n'
+               '\n'
+               '  %(prog)s --src-dir "/Volumes/Footage/Race Day"\n'
+               '      stabilize and grade every .mp4 there, writing both\n'
+               '      deliveries into "/Volumes/Footage/Race Day/Stabilized"\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("files", nargs="*", type=Path,
                    help="specific clips (default: every .mp4 in --src-dir)")
     p.add_argument("--src-dir", type=Path, default=None,
@@ -580,6 +598,17 @@ def main():
     if args.src_dir is None:
         p.print_help()
         sys.exit(2)
+
+    # Absolute from here on. Gyroflow is handed the work directory as a file://
+    # URL, and "file://.gyroflow-work" is a host name to a URL parser, not a
+    # relative path -- Gyroflow writes nowhere, never opens the pipe, and the
+    # reader blocks forever on a writer that is not coming. Resolving the
+    # command line once is cheaper than auditing every consumer of these paths.
+    args.src_dir = args.src_dir.resolve()
+    for attr in ("out_dir", "preset", "lut", "gyroflow", "work"):
+        given = getattr(args, attr)
+        if given is not None:
+            setattr(args, attr, given.resolve())
 
     # ---- preflight
     if not args.gyroflow.exists() and not args.dry_run:
