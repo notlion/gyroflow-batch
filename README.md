@@ -17,7 +17,7 @@ no multi-hundred-gigabyte intermediate file ever touches the disk.
 
 ## Requirements
 
-| | |
+| Component | Requirement |
 |---|---|
 | macOS | Apple silicon or Intel |
 | Python | 3.8 or newer — standard library only, nothing to `pip install` |
