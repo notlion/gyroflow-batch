@@ -22,12 +22,15 @@ Why a pipe works (verified against Gyroflow's source):
     non-seekable pipe
   * it hands the path straight to FFmpeg's avformat, with no seekable wrapper
 
+--src-dir is required and holds the clips, the .gyroflow preset and the .cube
+LUT. Deliveries land in <src-dir>/Stabilized.
+
 Usage:
-    ./stabilize_and_grade.py                      # every .mp4 in the source dir
-    ./stabilize_and_grade.py "ESK8 Heat 1.MP4"    # just these
-    ./stabilize_and_grade.py --dry-run            # show the derived plan
-    ./stabilize_and_grade.py --no-ungraded        # graded delivery only
-    ./stabilize_and_grade.py --mode file          # intermediate on disk instead
+    ./stabilize_and_grade.py --src-dir DIR                    # every .mp4 there
+    ./stabilize_and_grade.py --src-dir DIR "ESK8 Heat 1.MP4"  # just these
+    ./stabilize_and_grade.py --src-dir DIR --dry-run          # the derived plan
+    ./stabilize_and_grade.py --src-dir DIR --no-ungraded      # graded only
+    ./stabilize_and_grade.py --src-dir DIR --mode file        # on disk instead
 """
 
 import argparse
@@ -41,8 +44,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
-HERE = Path(__file__).resolve().parent
 
 # Everything this run puts in the work directory carries this tag, so two
 # invocations sharing a work directory cannot unlink each other's pipes.
@@ -539,7 +540,9 @@ def main():
         description="Gyroflow stabilization + LUT grade in a single delivery encode.")
     p.add_argument("files", nargs="*", type=Path,
                    help="specific clips (default: every .mp4 in --src-dir)")
-    p.add_argument("--src-dir", type=Path, default=HERE)
+    p.add_argument("--src-dir", type=Path, default=None,
+                   help="REQUIRED: folder holding the clips, the .gyroflow preset "
+                        "and the .cube LUT")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="default: <src-dir>/Stabilized")
     p.add_argument("--preset", type=Path, default=None,
@@ -570,6 +573,13 @@ def main():
                    help="let Gyroflow's log through to the terminal instead of a file; "
                         "it will tear through its own progress bar")
     args = p.parse_args()
+
+    # Required, but shown as the whole help rather than argparse's one-line usage
+    # error: the script no longer sits beside the footage, so where the clips are
+    # is the one thing it cannot guess and the first thing to get wrong.
+    if args.src_dir is None:
+        p.print_help()
+        sys.exit(2)
 
     # ---- preflight
     if not args.gyroflow.exists() and not args.dry_run:

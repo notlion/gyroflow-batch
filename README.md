@@ -145,15 +145,14 @@ The preset's *output folder* is deliberately ignored — see
 
 ## Running it
 
-The script defaults `--src-dir` to **its own directory**, so from the repo you
-normally point it at the footage:
+`--src-dir` is **required** — it is the folder holding the clips, the preset and
+the LUT. The script lives in this repo rather than beside your footage, so there
+is nothing sensible for it to default to; run it without one and you get this
+help text back.
 
 ```sh
 ./stabilize_and_grade.py --src-dir "/Volumes/Footage/Race Day"
 ```
-
-Alternatively, copy `stabilize_and_grade.py` into the footage folder and run it
-there with no arguments at all.
 
 Always start with a dry run — it prints the derived plan and the exact commands
 without touching anything:
@@ -176,24 +175,26 @@ without touching anything:
 More examples:
 
 ```sh
-# just two clips
-./stabilize_and_grade.py "Heat 1.MP4" "Heat 2.MP4"
+D="/Volumes/Footage/Race Day"
+
+# just two clips (names are relative to --src-dir)
+./stabilize_and_grade.py --src-dir "$D" "Heat 1.MP4" "Heat 2.MP4"
 
 # graded delivery only, no ungraded copy
-./stabilize_and_grade.py --no-ungraded
+./stabilize_and_grade.py --src-dir "$D" --no-ungraded
 
 # redo something that already exists
-./stabilize_and_grade.py --overwrite "Heat 1.MP4"
+./stabilize_and_grade.py --src-dir "$D" --overwrite "Heat 1.MP4"
 
 # no FIFO support on the volume? write a real intermediate instead
-./stabilize_and_grade.py --mode file
+./stabilize_and_grade.py --src-dir "$D" --mode file
 ```
 
 ### Options
 
 | Flag | Meaning |
 |---|---|
-| `--src-dir DIR` | where the clips are (default: the script's own directory) |
+| `--src-dir DIR` | **required** — where the clips, preset and LUT are |
 | `--out-dir DIR` | where deliveries go (default: `<src-dir>/Stabilized`) |
 | `--preset FILE` | default: the only `.gyroflow` in `--src-dir` |
 | `--lut FILE` | default: the only `.cube` in `--src-dir` |
