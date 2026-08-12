@@ -221,10 +221,18 @@ def fmt_duration(seconds):
 
 
 def draw_progress(label, pct, detail=""):
-    width = 30
+    # The line has to stay inside the window. One that reaches the last column
+    # wraps, and then \r rewinds only to the start of the wrapped fragment --
+    # every update leaves the row above it behind. Shrink the bar to fit, and
+    # trim the detail once the bar is down to its floor.
+    budget = max(1, shutil.get_terminal_size((80, 24)).columns - 1)
+    fixed = len(f"    {label} [] {pct:5.1f}%  ")
+    width = max(10, min(30, budget - fixed - len(detail)))
+    detail = detail[:max(0, budget - fixed - width)]
     filled = max(0, min(width, int(round(width * pct / 100))))
     bar = "#" * filled + "-" * (width - filled)
-    sys.stdout.write(f"\r    {label} [{bar}] {pct:5.1f}%  {detail}\033[K")
+    line = f"    {label} [{bar}] {pct:5.1f}%  {detail}".rstrip()
+    sys.stdout.write(f"\r{line[:budget]}\033[K")
     sys.stdout.flush()
 
 
