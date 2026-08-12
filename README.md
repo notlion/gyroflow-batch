@@ -166,10 +166,11 @@ without touching anything:
 ==> lut:          DJI O4 Air Unit Series D-Log M to Rec.709 V1.cube
 ==> final encode: H.265/HEVC  @ 124.00 Mbps, 3840x2160, gpu=True
 ==>   -> ffmpeg:  -c:v hevc_videotoolbox -profile:v main10 -allow_sw 1 …
+==>   -> color:   graded Rec.709-A (gama 1.96), ungraded Rec.709
 ==> intermediate: ProRes 4444 through a pipe
 ==> output:       /Volumes/Footage/Race Day/Stabilized
-==>   graded:     Heat 1 Stabilized Graded.mp4
-==>   ungraded:   Heat 1 Stabilized.mp4
+==>   graded:     Heat 1 Stabilized Graded.mov
+==>   ungraded:   Heat 1 Stabilized.mov
 ```
 
 More examples:
@@ -204,6 +205,7 @@ D="/Volumes/Footage/Race Day"
 | `--suffix STR` | name tag for the graded file (default: `" Stabilized Graded"`) |
 | `--ungraded-suffix STR` | name tag for the ungraded file (default: `" Stabilized"`) |
 | `--no-ungraded` | skip the ungraded copy |
+| `--rec709` | tag the graded file plain Rec.709 instead of Rec.709-A, and keep H.264/H.265 in `.mp4` |
 | `--mode file` | write a real ProRes intermediate instead of piping (~100 GB/clip) |
 | `--overwrite` | re-render files that already exist |
 | `--dry-run` | print the plan and exit |
@@ -223,6 +225,47 @@ sources by the next run — so each run ends up re-stabilizing its own output,
 producing files like `Heat 1 Stabilized Graded Stabilized Graded.mp4` and growing
 the work list every time. Keeping deliveries in a subfolder avoids that entirely.
 
+### Color tagging, and why the graded file is a `.mov`
+
+The graded delivery is tagged **Rec.709-A**: the usual Rec.709 tag (primaries,
+transfer and matrix all `1`, limited range) plus a `gama` atom of 1.96. That
+atom is what stops QuickTime Player on macOS from shifting the gamma, and it is
+the same thing Resolve writes when you pick Rec.709-A on a QuickTime delivery.
+No pixels change — it is metadata only.
+
+The `gama` atom is a QuickTime box, and ffmpeg refuses to write it into `.mp4`:
+
+```
+[mp4 @ ...] Not writing 'gama' atom. Format is not MOV.
+```
+
+So when Rec.709-A is on, H.264 and H.265 are delivered in `.mov` rather than
+`.mp4` — same encoder, same bitrate, same `hvc1`/`avc1` tag, just the QuickTime
+container, which is what Resolve does for a QuickTime H.265 export. ProRes,
+DNxHD and CineForm were already `.mov`.
+
+The **ungraded copy is left plain Rec.709**, with no `gama` atom. It is still
+D-Log M, and plain Rec.709 is exactly what the camera tagged it (DJI writes
+`colr nclx 1/1/1`, limited range) — so its tag survives the round trip
+unchanged. Only the graded file is genuinely Rec.709 after the LUT, so only it
+gets the Apple gamma.
+
+`--rec709` turns all of this off: the graded file gets the plain tag and
+H.264/H.265 stay in `.mp4`, as they were before.
+
+You can check what landed with:
+
+```sh
+ffprobe -v error -show_entries stream=color_primaries,color_transfer,color_space,color_range \
+  -of default=nk=0 "Heat 1 Stabilized Graded.mov"
+```
+
+`ffprobe` does not report the `gama` atom, so to confirm that one:
+
+```sh
+xxd "Heat 1 Stabilized Graded.mov" | grep -m1 -A1 gama   # 0001 f5c3  ->  1.96
+```
+
 ### Existing files are skipped
 
 Each delivery is checked on its own, so a run that lost only one of the two
@@ -230,10 +273,10 @@ re-renders just that one. `--overwrite` forces both.
 
 The check is existence only — it does not validate the file. **If a run was
 interrupted, delete its partial outputs before re-running**, or they will be
-treated as finished. A truncated MP4 has no `moov` atom and probes like this:
+treated as finished. A truncated file has no `moov` atom and probes like this:
 
 ```sh
-ffprobe -v error -show_entries format=duration -of csv=p=0 "Heat 1 Stabilized Graded.mp4"
+ffprobe -v error -show_entries format=duration -of csv=p=0 "Heat 1 Stabilized Graded.mov"
 # moov atom not found  ->  delete it
 ```
 

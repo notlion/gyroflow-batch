@@ -15,6 +15,11 @@ the graded one through the 3D LUT, and a stabilized-but-ungraded copy of the log
 original (--no-ungraded turns that one off). The source is decoded once, Gyroflow
 renders once, and no huge intermediate file is written.
 
+The graded delivery is tagged Rec.709-A -- Rec.709 plus a gama 1.96 atom, so
+QuickTime Player on macOS does not shift the gamma. That atom is QuickTime-only,
+so H.264/H.265 go into .mov rather than .mp4; --rec709 restores both. The
+ungraded copy stays plain Rec.709, the tag its D-Log M source already carries.
+
 Why a pipe works (verified against Gyroflow's source):
   * it renders to "<output_filename>.tmp" and renames when finished
   * it picks the muxer from the extension of the logical name, and ".mkv" is
@@ -86,12 +91,17 @@ AUDIO_ENCODER = {
 }
 
 
-def container_ext(codec):
+def container_ext(codec, rec709a=False):
     if codec in ("ProRes", "DNxHD", "CineForm"):
         return ".mov"
     if codec in ("EXR Sequence", "PNG Sequence"):
         return None
-    return ".mp4"
+    # H.264/H.265 would default to .mp4, but the gama atom that makes a file
+    # Rec.709-A is a QuickTime box: ffmpeg refuses to write it into .mp4
+    # ("Not writing 'gama' atom. Format is not MOV."). Delivering them in .mov
+    # instead is what Resolve does for a QuickTime H.265 export -- same encode,
+    # same bitrate, and the hvc1/avc1 tag is already set either way.
+    return ".mov" if rec709a else ".mp4"
 
 
 def build_video_args(out, fps):
@@ -415,7 +425,7 @@ def make_out_params(out, work, filename, prores_variant):
 def run_one(src, args, out_block, inter_preset, work):
     stem = src.stem
     codec = out_block.get("codec", "H.265/HEVC")
-    ext = container_ext(codec)
+    ext = container_ext(codec, args.rec709a)
     if ext is None:
         die(f"codec {codec!r} writes an image sequence, which has no delivery "
             f"encode to save. Render those straight from Gyroflow instead.")
@@ -449,7 +459,16 @@ def run_one(src, args, out_block, inter_preset, work):
         ffmpeg_cmd += build_audio_args(out_block, has_audio)
         ffmpeg_cmd += ["-color_range", "tv", "-colorspace", "bt709",
                        "-color_primaries", "bt709", "-color_trc", "bt709"]
-        ffmpeg_cmd += ["-movflags", "+faststart"] if ext in (".mp4", ".mov") else []
+        # Those four tags alone are plain Rec.709 -- 1/1/1 limited, which is
+        # exactly what the DJI source carries, so the ungraded log copy keeps
+        # them and nothing else. Rec.709-A is that same tag plus a gama atom of
+        # 1.96; QuickTime Player reads it and stops shifting the gamma, and it
+        # only ever goes on the graded delivery, which is the one that is
+        # actually Rec.709 after the LUT.
+        gama = args.rec709a and kind == "graded" and ext == ".mov"
+        movflags = "+faststart" + ("+write_gama" if gama else "")
+        ffmpeg_cmd += ["-movflags", movflags] if ext in (".mp4", ".mov") else []
+        ffmpeg_cmd += ["-mov_gamma", "1.96"] if gama else []
         ffmpeg_cmd += ["-metadata", f"comment={comment}"] if comment else []
         ffmpeg_cmd += [str(path)]
 
@@ -585,6 +604,13 @@ def main():
     p.add_argument("--no-ungraded", dest="ungraded", action="store_false",
                    help="skip the stabilized-but-ungraded copy that is written alongside "
                         "the graded one by default")
+    p.add_argument("--rec709", dest="rec709a", action="store_false",
+                   help="tag the graded delivery plain Rec.709 instead of Rec.709-A, "
+                        "and leave H.264/H.265 in .mp4. By default the graded file gets "
+                        "a gama 1.96 atom so QuickTime Player on macOS shows the gamma "
+                        "correctly; since that atom is QuickTime-only, those codecs are "
+                        "delivered in .mov. The ungraded copy is plain Rec.709 either "
+                        "way, matching the tag the camera wrote")
     p.add_argument("--mode", default="pipe", choices=["pipe", "file"],
                    help="'file' writes a real ProRes intermediate (needs ~100 GB/clip)")
     p.add_argument("--overwrite", action="store_true",
@@ -692,9 +718,11 @@ def main():
          f"{out_block.get('output_width')}x{out_block.get('output_height')}, "
          f"gpu={out_block.get('use_gpu')}")
     info(f"  -> ffmpeg:  {shlex.join(build_video_args(out_block, fps))}")
+    info(f"  -> color:   " + ("graded Rec.709-A (gama 1.96), ungraded Rec.709"
+                              if args.rec709a else "Rec.709 (--rec709)"))
     info(f"intermediate: ProRes {args.prores} through a {args.mode}")
     # Names for the first clip, which is what the rest are patterned on.
-    ext = container_ext(out_block.get("codec", "H.265/HEVC")) or ""
+    ext = container_ext(out_block.get("codec", "H.265/HEVC"), args.rec709a) or ""
     info(f"output:       {args.out_dir}"
          + (f"  (first of {len(files)} clips shown)" if len(files) > 1 else ""))
     info(f"  graded:     {files[0].stem}{args.suffix}{ext}")
