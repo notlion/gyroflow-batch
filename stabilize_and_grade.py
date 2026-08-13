@@ -30,11 +30,22 @@ Why a pipe works (verified against Gyroflow's source):
 --src-dir is required and holds the clips, the .gyroflow preset and the .cube
 LUT. Deliveries land in <src-dir>/Stabilized.
 
+Gyroflow is skipped per clip when it would have nothing to do. DJI keeps its
+telemetry in a "djmd" data track, and this measures how often orientation samples
+arrive there: an unstabilized camera like an O4 Pro air unit logs a couple of
+thousand per second, while a gimballed drone like a Mini 5 Pro logs exactly one
+per frame -- the attitude of a camera that is already mechanically steady. Clips
+of the second kind go straight to the grade, reusing the file mode with the
+render already done: ffmpeg reads the clip itself and the LUT is all that is
+applied. A clip whose telemetry cannot be read is always stabilized, since
+skipping one that needed it is far worse than running one that did not.
+
 Usage:
     ./stabilize_and_grade.py --src-dir DIR                    # every .mp4 there
     ./stabilize_and_grade.py --src-dir DIR "ESK8 Heat 1.MP4"  # just these
     ./stabilize_and_grade.py --src-dir DIR --dry-run          # the derived plan
     ./stabilize_and_grade.py --src-dir DIR --no-ungraded      # graded only
+    ./stabilize_and_grade.py --src-dir DIR --force-stabilize  # stabilize regardless
     ./stabilize_and_grade.py --src-dir DIR --mode file        # on disk instead
 """
 
@@ -45,6 +56,7 @@ import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -173,15 +185,22 @@ def build_audio_args(out, source_has_audio):
 # ------------------------------------------------------------------- probing
 
 def probe(path):
-    """Return (fps, has_audio) for a source file."""
+    """Return (fps, has_audio, seconds) for a source file."""
     try:
         raw = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,r_frame_rate", "-of", "json", str(path)],
+             "stream=codec_type,r_frame_rate:format=duration",
+             "-of", "json", str(path)],
             capture_output=True, text=True, check=True).stdout
-        streams = json.loads(raw).get("streams", [])
+        probed = json.loads(raw)
+        streams = probed.get("streams", [])
     except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return None, False
+        return None, False, None
+
+    try:
+        seconds = float(probed.get("format", {}).get("duration"))
+    except (TypeError, ValueError):        # missing, or the literal "N/A"
+        seconds = None
 
     fps = None
     has_audio = False
@@ -196,7 +215,134 @@ def probe(path):
                     fps = float(num) / float(den)
             except ValueError:
                 pass
-    return fps, has_audio
+    return fps, has_audio, seconds
+
+
+# -------------------------------------------- is there anything to stabilize?
+
+# DJI keeps its telemetry in a "djmd" data track holding protobuf whose schema is
+# per-camera (dvtm_O4P.proto, dvtm_Mini5Pro.proto, ...). Rather than model any of
+# them, this walks the wire format looking for one thing: unit quaternions, in
+# both encodings DJI uses -- 16 bytes of packed floats, and four tagged f32
+# fields in a 20-byte submessage.
+#
+# What separates a clip worth stabilizing from one that is not is the RATE. An O4
+# Pro air unit logs orientation ~2000-3000 times a second, far finer than the
+# frame rate, which is what rolling-shutter correction and smoothing need. A
+# gimballed drone like the Mini 5 Pro logs exactly one sample per frame: the
+# attitude of a camera that is already mechanically steady, which Gyroflow has
+# nothing to improve on.
+
+# Two samples per frame is the line. Measured against the two cameras this was
+# built from, an O4 Pro sits at 33x the frame rate and a Mini 5 Pro at 1.0x, so
+# there is a wide gap either side and the exact factor is not delicate.
+MOTION_RATE_FACTOR = 2
+
+# How many seconds of the telemetry track to read. Enough to average over, small
+# enough that it is a few hundred kB and about a tenth of a second.
+MOTION_WINDOW = 3
+
+
+def _varint(d, i):
+    value = shift = 0
+    while i < len(d):
+        b = d[i]; i += 1
+        value |= (b & 0x7f) << shift; shift += 7
+        if not b & 0x80:
+            return value, i
+    raise IndexError("truncated varint")
+
+
+def _is_unit_quaternion(f):
+    """Four finite components on the unit sphere. Real orientation samples pass;
+    the float-shaped coincidences in a telemetry blob essentially never do."""
+    return (all(x == x and abs(x) <= 1.001 for x in f)
+            and 0.98 < sum(x * x for x in f) < 1.02)
+
+
+def _count_quaternions(d, depth=0, maxdepth=8):
+    """Count unit quaternions anywhere in a protobuf message.
+
+    Field numbers are never interpreted, only skipped over, so this neither knows
+    nor cares which DJI schema it is reading: an unfamiliar one simply scores low
+    rather than being misread.
+    """
+    found = i = 0
+    while i < len(d):
+        try:
+            key, i = _varint(d, i)
+            field, wire = key >> 3, key & 7
+            if field == 0:                       # not protobuf, or run off the end
+                return found
+            if wire == 0:
+                _, i = _varint(d, i)
+            elif wire == 1:
+                i += 8
+            elif wire == 5:
+                i += 4
+            elif wire == 2:
+                length, i = _varint(d, i)
+                if i + length > len(d):
+                    return found
+                blob = d[i:i + length]; i += length
+                if length == 16:
+                    if _is_unit_quaternion(struct.unpack("<4f", blob)):
+                        found += 1
+                elif length == 20 and all(blob[j] & 7 == 5 for j in (0, 5, 10, 15)):
+                    if _is_unit_quaternion([struct.unpack("<f", blob[j + 1:j + 5])[0]
+                                            for j in (0, 5, 10, 15)]):
+                        found += 1
+                if depth < maxdepth and length > 1:
+                    found += _count_quaternions(blob, depth + 1, maxdepth)
+            else:                                # wire types 3/4 are long gone
+                return found
+        except (IndexError, struct.error):
+            return found
+    return found
+
+
+def orientation_rate(src):
+    """Orientation samples per second in this clip's DJI telemetry track.
+
+    None means "could not tell" -- no DJI track, or a payload this does not
+    recognise -- and never "none found". Callers must stabilize when unsure:
+    running a render that was not needed costs time, skipping one that was
+    silently ships unstabilized footage.
+    """
+    try:
+        raw = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_tag_string",
+             "-of", "json", str(src)],
+            capture_output=True, text=True, check=True).stdout
+        streams = json.loads(raw).get("streams", [])
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+    index = next((s["index"] for s in streams
+                  if s.get("codec_tag_string") == "djmd"), None)
+    if index is None:
+        return None
+
+    # -t ahead of -i stops the demuxer early, so this reads a few hundred kB off
+    # the front of the file rather than walking a 2 GB clip.
+    data = subprocess.run(
+        ["ffmpeg", "-v", "error", "-t", str(MOTION_WINDOW), "-i", str(src),
+         "-map", f"0:{index}", "-c", "copy", "-f", "data", "-"],
+        capture_output=True).stdout
+    # DJI names its schema in the first packet. Without that marker this is a
+    # payload we have never seen, where a low count would prove nothing.
+    if b".proto" not in data[:4096]:
+        return None
+    return _count_quaternions(data) / MOTION_WINDOW
+
+
+def decide_stabilize(src, args, fps):
+    """(run Gyroflow?, the sample rate that decided it) for one clip."""
+    if args.force_stabilize:
+        return True, None
+    rate = orientation_rate(src)
+    if rate is None or not fps:
+        return True, rate
+    return rate > MOTION_RATE_FACTOR * fps, rate
 
 
 # ------------------------------------------------------------ filter graph
@@ -276,6 +422,55 @@ def run_gyroflow(cmd, log_path, verbose):
                     continue
 
                 log.write(line + "\n")
+        finally:
+            proc.stdout.close()
+            rc = proc.wait()
+            if drew:
+                clear_progress()
+    return rc
+
+
+# -progress emits plain key=value lines; out_time is the only one worth reading.
+# The out_time_us/out_time_ms lines beside it do not match, which is the point.
+FF_TIME_RE = re.compile(r"^out_time=(\d+):(\d+):([\d.]+)")
+
+
+def run_ffmpeg(cmd, log_path, seconds):
+    """Encode, drawing a progress bar from ffmpeg's own -progress stream.
+
+    Only for the branch where ffmpeg runs on its own. In pipe mode it is Gyroflow
+    that sets the pace and its bar already has that line; here nothing else is
+    reporting, so without this the terminal sits silent for the whole encode.
+    """
+    if not (sys.stdout.isatty() and seconds):
+        with log_path.open("wb") as log:
+            return subprocess.run(cmd, stdout=log, stderr=log).returncode
+
+    # Progress goes to stdout for us to read, which leaves stderr alone as the log.
+    cmd = cmd[:1] + ["-progress", "pipe:1"] + cmd[1:]
+    started = time.monotonic()
+    drew = False
+    with log_path.open("w", errors="replace") as log:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
+                                text=True, errors="replace")
+        try:
+            for line in proc.stdout:
+                m = FF_TIME_RE.match(line)
+                if not m:
+                    continue
+                hours, mins, secs = m.groups()
+                done = int(hours) * 3600 + int(mins) * 60 + float(secs)
+                detail = f"{fmt_duration(done)}/{fmt_duration(seconds)}"
+                if done > 0:
+                    eta = (seconds - done) * (time.monotonic() - started) / done
+                    detail += f"  ETA {fmt_duration(max(0, eta))}"
+                draw_progress("grade ", min(100.0, done / seconds * 100), detail)
+                drew = True
+        except BaseException:
+            # subprocess.run, which this replaced, kills its child on Ctrl-C. Keep
+            # that: an encode left running would rewrite the output we delete.
+            proc.kill()
+            raise
         finally:
             proc.stdout.close()
             rc = proc.wait()
@@ -430,15 +625,24 @@ def make_out_params(out, work, filename, prores_variant):
 
 # ------------------------------------------------------------------- runner
 
-def run_one(src, args, out_block, inter_preset, work):
+def run_one(src, args, out_block, inter_preset, work, decision):
     stem = src.stem
     codec = out_block.get("codec", "H.265/HEVC")
     ext = container_ext(codec, args.rec709a)
     if ext is None:
         die(f"codec {codec!r} writes an image sequence, which has no delivery "
             f"encode to save. Render those straight from Gyroflow instead.")
-    targets = [("graded", args.out_dir / f"{stem}{args.suffix}{ext}")]
-    if args.ungraded:
+    fps, has_audio, seconds = probe(src)
+    stabilize, rate = decision
+    if not stabilize:
+        info(f"no motion data to stabilize with — {rate:.0f} orientation samples/s "
+             f"at {fps:.2f} fps is one per frame; grading only")
+
+    # A clip that is not stabilized must not be named as though it were, and its
+    # ungraded copy would be a plain transcode of the source.
+    targets = [("graded", args.out_dir /
+                f"{stem}{args.suffix if stabilize else args.unstabilized_suffix}{ext}")]
+    if args.ungraded and stabilize:
         targets.append(("plain", args.out_dir / f"{stem}{args.ungraded_suffix}{ext}"))
 
     # Each output is skipped on its own, so a run that only lost one of the two
@@ -451,7 +655,6 @@ def run_one(src, args, out_block, inter_preset, work):
     if not targets:
         return "skipped"
 
-    fps, has_audio = probe(src)
     want_audio = has_audio and bool(out_block.get("audio", True))
     comment = (out_block.get("metadata") or {}).get("comment", "")
 
@@ -489,8 +692,10 @@ def run_one(src, args, out_block, inter_preset, work):
     gf_tmp = work / f"{gf_filename}.tmp"
 
     # File mode hands ffmpeg the finished render; pipe mode hands it the FIFO,
-    # which lives at the .tmp name because that is what Gyroflow opens.
-    ffmpeg_cmd[ffmpeg_cmd.index(None)] = str(gf_final if args.mode == "file" else gf_tmp)
+    # which lives at the .tmp name because that is what Gyroflow opens. A clip
+    # with no motion data has no render at all, so it reads the clip itself.
+    ff_input = src if not stabilize else gf_final if args.mode == "file" else gf_tmp
+    ffmpeg_cmd[ffmpeg_cmd.index(None)] = str(ff_input)
 
     out_params = make_out_params(out_block, work, gf_filename, args.prores)
     # --stdout-progress gives us parseable progress lines. Its own bar would fight
@@ -499,7 +704,8 @@ def run_one(src, args, out_block, inter_preset, work):
               "-f", "--stdout-progress", "-p", out_params]
 
     if args.dry_run:
-        print(f"  gyroflow: {shlex.join(gf_cmd)}")
+        if stabilize:
+            print(f"  gyroflow: {shlex.join(gf_cmd)}")
         print(f"  ffmpeg:   {shlex.join(ffmpeg_cmd)}")
         return "skipped"
 
@@ -511,15 +717,21 @@ def run_one(src, args, out_block, inter_preset, work):
     ff = None
     started = time.monotonic()
     try:
-        if args.mode == "file":
-            gf_rc = run_gyroflow(gf_cmd, gflog, args.verbose)
+        if not stabilize or args.mode == "file":
+            # A clip we are not stabilizing is this branch with the render already
+            # sitting there: ffmpeg reads a finished file either way.
+            gf_rc = run_gyroflow(gf_cmd, gflog, args.verbose) if stabilize else 0
             if gf_rc != 0:
                 warn(f"gyroflow failed on {src.name} (exit {gf_rc})")
                 dump_log(gflog, "gyroflow")
                 gyroflow_failure_hint(gf_rc)
                 return "failed"
-            with fflog.open("wb") as log:
-                ff_rc = subprocess.run(ffmpeg_cmd, stdout=log, stderr=log).returncode
+            # How long the file ffmpeg is about to read runs for, which is the
+            # source only when it was not stabilized: trims in the preset make its
+            # render shorter, and the bar should reach 100% on the real thing.
+            if ff_input != src:
+                _, _, seconds = probe(ff_input)
+            ff_rc = run_ffmpeg(ffmpeg_cmd, fflog, seconds)
         else:
             os.mkfifo(gf_tmp)
             # Reader first: opening a FIFO blocks until the other end shows up.
@@ -546,7 +758,8 @@ def run_one(src, args, out_block, inter_preset, work):
             info(f"done in {elapsed}: {', '.join(p.name for _, p in targets)}")
             return "ok"
 
-        warn(f"failed after {elapsed}: {src.name} (gyroflow={gf_rc} ffmpeg={ff_rc})")
+        rcs = f"gyroflow={gf_rc} ffmpeg={ff_rc}" if stabilize else f"ffmpeg={ff_rc}"
+        warn(f"failed after {elapsed}: {src.name} ({rcs})")
         dump_log(fflog, "ffmpeg")
         for _, path in targets:
             path.unlink(missing_ok=True)
@@ -606,9 +819,13 @@ def main():
                    choices=["Proxy", "LT", "Standard", "HQ", "4444", "4444XQ"],
                    help="intermediate ProRes variant through the pipe (default: 4444)")
     p.add_argument("--suffix", default=" Stabilized Graded",
-                   help="name tag for the graded delivery (default: %(default)r)")
+                   help="name tag for the graded delivery, which is only used for a "
+                        "clip that was stabilized (default: %(default)r)")
     p.add_argument("--ungraded-suffix", default=" Stabilized",
                    help="name tag for the ungraded delivery (default: %(default)r)")
+    p.add_argument("--unstabilized-suffix", default=" Graded",
+                   help="name tag for a clip that is graded without being stabilized, "
+                        "because it carries no motion data (default: %(default)r)")
     p.add_argument("--no-ungraded", dest="ungraded", action="store_false",
                    help="skip the stabilized-but-ungraded copy that is written alongside "
                         "the graded one by default")
@@ -619,6 +836,14 @@ def main():
                         "correctly; since that atom is QuickTime-only, those codecs are "
                         "delivered in .mov. The ungraded copy is plain Rec.709 either "
                         "way, matching the tag the camera wrote")
+    p.add_argument("--force-stabilize", action="store_true",
+                   help="run Gyroflow for every clip even where no motion data was "
+                        "found. Whether to stabilize is otherwise decided per clip: one "
+                        "whose telemetry carries no orientation samples faster than its "
+                        "frame rate has nothing to stabilize with, and is graded "
+                        "directly. Use this if a camera logs its motion somewhere this "
+                        "script cannot read, and clips are being graded without being "
+                        "stabilized")
     p.add_argument("--mode", default="pipe", choices=["pipe", "file"],
                    help="'file' writes a real ProRes intermediate (needs ~100 GB/clip)")
     p.add_argument("--overwrite", action="store_true",
@@ -652,9 +877,6 @@ def main():
             setattr(args, attr, given.resolve())
 
     # ---- preflight
-    if not args.gyroflow.exists() and not args.dry_run:
-        die(f"Gyroflow CLI not found at: {args.gyroflow}\n"
-            f"   Pass --gyroflow /path/to/Gyroflow.app/Contents/MacOS/gyroflow")
     if not args.src_dir.is_dir():
         die(f"source directory not found: {args.src_dir}")
     if args.preset is None:
@@ -678,9 +900,6 @@ def main():
             f"   Re-save the preset from Gyroflow with the \"Export settings\" group\n"
             f"   ticked — this script reads your delivery settings from it.")
 
-    if out_block.get("export_trims_separately"):
-        die("'export_trims_separately' splits the render across several files, "
-            "which the single-pipe design cannot express. Turn it off in the preset.")
     if out_block.get("preserve_other_tracks"):
         warn("'preserve_other_tracks' is set; the DJI metadata tracks cannot survive "
              "the pipe and will be dropped.")
@@ -701,41 +920,84 @@ def main():
     if not files:
         die(f"no .mp4 files found in {args.src_dir}")
 
+    # ---- which clips Gyroflow actually has work to do on. Decided for the whole
+    # batch up front: a run that needs Gyroflow then finds out it is missing now
+    # rather than four clips in, and a folder of gimballed footage never asks for
+    # it at all. Costs one telemetry read per clip, about a tenth of a second.
+    decisions = {src: decide_stabilize(src, args, probe(src)[0])
+                 for src in files if src.is_file()}
+    stabilizing = [src for src, (yes, _) in decisions.items() if yes]
+
+    # Only Gyroflow acts on the trims, so a batch that never starts it can ignore
+    # them -- which is why this waits for the decisions rather than sitting with
+    # the other preset checks above.
+    if stabilizing and out_block.get("export_trims_separately"):
+        die("'export_trims_separately' splits the render across several files, "
+            "which the single-pipe design cannot express. Turn it off in the preset.")
+    if stabilizing and not args.gyroflow.exists() and not args.dry_run:
+        die(f"Gyroflow CLI not found at: {args.gyroflow}\n"
+            f"   Pass --gyroflow /path/to/Gyroflow.app/Contents/MacOS/gyroflow\n"
+            f"   ({len(stabilizing)} of {len(decisions)} clips carry motion data)")
+
     # Beside the footage by default: that drive is usually the roomy one, and it
     # keeps the pipe — and any --mode file intermediate — off the system disk.
     default_work = args.work is None
     if default_work:
         args.work = args.src_dir / ".gyroflow-work"
     args.work.mkdir(parents=True, exist_ok=True)
-    # Gyroflow's -p parser rewrites every ' into " before parsing the JSON.
-    if "'" in str(args.work) or '"' in str(args.work):
+    # Gyroflow's -p parser rewrites every ' into " before parsing the JSON. It
+    # never sees the path when no clip is being stabilized, where only the log
+    # lands there.
+    if stabilizing and ("'" in str(args.work) or '"' in str(args.work)):
         die("the work directory path must not contain quotes or apostrophes")
     if not args.dry_run:
-        if args.mode == "pipe":
+        if args.mode == "pipe" and stabilizing:
             check_fifo_support(args.work)
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    inter_preset = make_intermediate_preset(preset, args.work)
+    inter_preset = make_intermediate_preset(preset, args.work) if stabilizing else None
 
-    # ---- show the derived plan; this is the bit worth eyeballing
-    fps, _ = probe(files[0])
+    # ---- show the derived plan; this is the bit worth eyeballing. Everything
+    # downstream of "stabilize" is decided per clip, so this shows the first one.
+    fps, _, _ = probe(files[0])
+    stabilize, rate = decisions.get(files[0], (True, None))
     info(f"preset:       {args.preset.name}")
     info(f"lut:          {args.lut.name}")
+    if args.force_stabilize:
+        motion = "on for every clip (--force-stabilize)"
+    elif rate is None:
+        motion = "on — no DJI telemetry to read, so nothing is skipped"
+    elif stabilize:
+        motion = f"on — {rate:.0f} orientation samples/s at {fps:.2f} fps"
+    else:
+        motion = (f"off — {rate:.0f} samples/s at {fps:.2f} fps is one per frame, "
+                  f"so there is nothing to stabilize with")
+    info(f"stabilize:    {motion}"
+         + ("  (re-checked per clip)"
+            if len(files) > 1 and not args.force_stabilize else ""))
+    # Resizing to the preset's output size is Gyroflow's to do, so with Gyroflow
+    # out of the picture the frames arrive at whatever size the camera wrote.
+    size = (f"{out_block.get('output_width')}x{out_block.get('output_height')}"
+            if stabilize else "source size")
     info(f"final encode: {out_block.get('codec')} "
          f"{out_block.get('codec_options') or ''} @ {out_block.get('bitrate', 0):.2f} Mbps, "
-         f"{out_block.get('output_width')}x{out_block.get('output_height')}, "
-         f"gpu={out_block.get('use_gpu')}")
+         f"{size}, gpu={out_block.get('use_gpu')}")
     info(f"  -> ffmpeg:  {shlex.join(build_video_args(out_block, fps))}")
-    info(f"  -> color:   " + ("graded Rec.709-A (gama 1.96), ungraded Rec.709"
-                              if args.rec709a else "Rec.709 (--rec709)"))
-    info(f"intermediate: ProRes {args.prores} through a {args.mode}")
+    info(f"  -> color:   " + ("Rec.709 (--rec709)" if not args.rec709a else
+                              "graded Rec.709-A (gama 1.96)"
+                              + (", ungraded Rec.709" if args.ungraded and stabilize else "")))
+    info(f"intermediate: " + (f"ProRes {args.prores} through a {args.mode}" if stabilize
+                              else "none — the LUT only, Gyroflow not run"))
     # Names for the first clip, which is what the rest are patterned on.
     ext = container_ext(out_block.get("codec", "H.265/HEVC"), args.rec709a) or ""
     info(f"output:       {args.out_dir}"
          + (f"  (first of {len(files)} clips shown)" if len(files) > 1 else ""))
-    info(f"  graded:     {files[0].stem}{args.suffix}{ext}")
+    info(f"  graded:     {files[0].stem}"
+         f"{args.suffix if stabilize else args.unstabilized_suffix}{ext}")
     info(f"  ungraded:   " + (f"{files[0].stem}{args.ungraded_suffix}{ext}"
-                              if args.ungraded else "off (--no-ungraded)"))
+                              if args.ungraded and stabilize
+                              else "off (not stabilized)" if not stabilize
+                              else "off (--no-ungraded)"))
 
     if not args.dry_run and prevent_sleep():
         info("idle sleep held off for the duration of this run")
@@ -750,7 +1012,8 @@ def main():
                 continue
             print()
             info(src.name)
-            result = run_one(src, args, out_block, inter_preset, args.work)
+            result = run_one(src, args, out_block, inter_preset, args.work,
+                             decisions[src])
             counts[result] += 1
             if result == "failed":
                 failed.append(src.name)
@@ -758,7 +1021,8 @@ def main():
         print()
         warn("aborted by user")
     finally:
-        inter_preset.unlink(missing_ok=True)
+        if inter_preset:
+            inter_preset.unlink(missing_ok=True)
         if default_work:
             try:
                 args.work.rmdir()   # only succeeds when empty, so it also tidies

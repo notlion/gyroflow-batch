@@ -13,6 +13,10 @@ stabilized-but-ungraded copy of the log original.
 The source is decoded once, Gyroflow renders once, nothing is encoded twice, and
 no multi-hundred-gigabyte intermediate file ever touches the disk.
 
+Clips that have nothing to stabilize — gimballed drone footage, say — are
+detected and sent straight to the grade, skipping the Gyroflow half entirely.
+See [Clips with nothing to stabilize](#clips-with-nothing-to-stabilize-are-graded-directly).
+
 ---
 
 ## Requirements
@@ -164,6 +168,7 @@ without touching anything:
 ```
 ==> preset:       stabilization-settings.gyroflow
 ==> lut:          DJI O4 Air Unit Series D-Log M to Rec.709 V1.cube
+==> stabilize:    on — 2002 orientation samples/s at 59.94 fps  (re-checked per clip)
 ==> final encode: H.265/HEVC  @ 124.00 Mbps, 3840x2160, gpu=True
 ==>   -> ffmpeg:  -c:v hevc_videotoolbox -profile:v main10 -allow_sw 1 …
 ==>   -> color:   graded Rec.709-A (gama 1.96), ungraded Rec.709
@@ -187,6 +192,9 @@ D="/Volumes/Footage/Race Day"
 # redo something that already exists
 ./stabilize_and_grade.py --src-dir "$D" --overwrite "Heat 1.MP4"
 
+# stabilize everything, even clips detected as having no motion data
+./stabilize_and_grade.py --src-dir "$D" --force-stabilize
+
 # no FIFO support on the volume? write a real intermediate instead
 ./stabilize_and_grade.py --src-dir "$D" --mode file
 ```
@@ -204,8 +212,10 @@ D="/Volumes/Footage/Race Day"
 | `--prores VARIANT` | intermediate quality through the pipe (default: `4444`) |
 | `--suffix STR` | name tag for the graded file (default: `" Stabilized Graded"`) |
 | `--ungraded-suffix STR` | name tag for the ungraded file (default: `" Stabilized"`) |
+| `--unstabilized-suffix STR` | name tag for a clip graded without stabilization (default: `" Graded"`) |
 | `--no-ungraded` | skip the ungraded copy |
 | `--rec709` | tag the graded file plain Rec.709 instead of Rec.709-A, and keep H.264/H.265 in `.mp4` |
+| `--force-stabilize` | stabilize every clip, even where no motion data was found |
 | `--mode file` | write a real ProRes intermediate instead of piping (~100 GB/clip) |
 | `--overwrite` | re-render files that already exist |
 | `--dry-run` | print the plan and exit |
@@ -224,6 +234,80 @@ the footage itself, and deliveries sitting beside the sources get picked up as
 sources by the next run — so each run ends up re-stabilizing its own output,
 producing files like `Heat 1 Stabilized Graded Stabilized Graded.mp4` and growing
 the work list every time. Keeping deliveries in a subfolder avoids that entirely.
+
+### Clips with nothing to stabilize are graded directly
+
+Not every clip needs Gyroflow. Footage from a mechanically gimballed drone is
+already steady, and running it through a stabilization pass costs a full extra
+render to change nothing. The script detects this **per clip** and skips the
+Gyroflow half when there is nothing to work with.
+
+**How it decides.** DJI writes telemetry into a `djmd` data track — protobuf,
+with a different schema per camera (`dvtm_O4P.proto`, `dvtm_Mini5Pro.proto`, …).
+Rather than model those, the script reads three seconds of that track and counts
+one thing: unit quaternions. What matters is not whether orientation data exists
+but **how fast it arrives**:
+
+| Camera | Orientation samples | vs 59.94 fps | Verdict |
+|---|---|---|---|
+| O4 Pro air unit | 2002–2969 /s | ~33× | real IMU → stabilize |
+| Mini 5 Pro (gimballed) | 60 /s | 1.0× | one per frame → grade only |
+
+Sub-frame sampling is motion data — it is what rolling-shutter correction and
+smoothing consume. Exactly one sample per frame is a *record* of where an
+already-stabilized camera was pointing, which Gyroflow cannot improve on. The
+threshold sits at twice the frame rate, with roughly 16× of headroom on one side
+and 1.5× on the other, so it is not a delicate number.
+
+```
+==> stabilize:    off — 60 samples/s at 59.94 fps is one per frame, so there is nothing to stabilize with
+==> intermediate: none — the LUT only, Gyroflow not run
+==>   graded:     DJI_20260808163613_0037_D Graded.mov
+==>   ungraded:   off (not stabilized)
+```
+
+**It fails toward stabilizing.** If the clip has no DJI telemetry track, or
+carries a payload the parser does not recognise, the answer is "stabilize" — not
+"skip". Running a render that was not needed costs time; skipping one that was
+needed silently ships unstabilized footage. Non-DJI clips are therefore never
+skipped, and behave exactly as they did before.
+
+Three things change for a clip that is not stabilized:
+
+- **No ungraded copy.** The second delivery exists to preserve the *stabilized*
+  log original; without stabilization it would be a plain transcode of a file you
+  already have, so it is not written.
+- **The name tag is `" Graded"`**, not `" Stabilized Graded"` — see
+  `--unstabilized-suffix`.
+- **Frames keep their source size.** Resizing to the preset's output size is
+  Gyroflow's job, and Gyroflow never sees the clip.
+
+**Override.** `--force-stabilize` runs Gyroflow for every clip whatever the
+detection says. Reach for it if a camera logs its motion somewhere this cannot
+read and clips are being graded without being stabilized.
+
+If no clip in the batch needs stabilizing, Gyroflow does not have to be installed
+at all, the work directory holds nothing but the ffmpeg log so it does not need
+to support FIFOs, and `export trims separately` in the preset stops being an
+error — all three are Gyroflow's concerns only.
+
+### Progress
+
+Pipe mode shows one bar: Gyroflow is the slow half, and the encoder keeps pace
+with it through the pipe.
+
+A clip that is not stabilized, and anything under `--mode file`, runs the encode
+on its own, so it gets a bar of its own — drawn from ffmpeg's `-progress` output
+and measured against the duration of the file being read. In `--mode file` that
+is the second of two:
+
+```
+    render [#####################---------]  70.4%  1267/1800 frames  ETA 3m18s
+    grade  [############------------------]  41.2%  24s/60s  ETA 1m12s
+```
+
+Both bars are terminal-only. Redirect the output and they are left out, so logs
+stay clean.
 
 ### Color tagging, and why the graded file is a `.mov`
 
@@ -310,6 +394,7 @@ Two limits: the assertion against system sleep only applies on AC power, and
 | `exit 101`, `PermissionDenied` in the trace | Mac App Store Gyroflow. Install the `.dmg` from gyroflow.xyz. |
 | `has no 'output' block` | Preset saved without the **Export settings** group ticked. |
 | `no .cube file in …` | LUT missing from `--src-dir`, or pass `--lut` explicitly. |
+| A clip was graded but not stabilized | Its telemetry had no sub-frame motion data — check the `stabilize:` line. `--force-stabilize` overrides. |
 | `cannot create a named pipe` | Work directory is on exFAT or a network share. Use `--work` or `--mode file`. |
 | `ffmpeg/ffprobe not on PATH` | `brew install ffmpeg`, and check Homebrew's shell setup ran. |
 | Two `.cube` or `.gyroflow` files found | It warns and uses the first; pass `--lut` / `--preset` to choose. |
