@@ -9,3 +9,7 @@ __pycache__/
 # Script output, in case it is run with --src-dir left at its default (here)
 .gyroflow-work/
 Stabilized/
+
+# The mp4_merge tool, dropped beside the script under its download name
+# (mp4_merge-mac-arm64, mp4_merge-windows64.exe, ...)
+mp4_merge*
