@@ -925,6 +925,41 @@ def build_filter_complex(lut, kinds):
 # now, trim_ranges (fractions of the clip) and trim_start/trim_end before that.
 TRIM_KEYS = ("trim_ranges_ms", "trim_ranges", "trim_start", "trim_end")
 
+# What Gyroflow's own "Create preset" dialog can carry (SettingsSelector.qml):
+# a key maps to None to keep it whole, or to the sub-keys it keeps. Everything
+# else in a saved project belongs to the clip it was made from.
+PRESET_KEYS = {
+    "version": None, "name": None,
+    "video_info": ("rotation", "fps_scale", "vfr_fps"),
+    "calibration_data": None, "light_refraction_coefficient": None,
+    "plugin_disable_stretch": None,
+    "gyro_source": ("lpf", "mf", "rotation", "acc_rotation", "gyro_bias",
+                    "imu_orientation", "integration_method"),
+    "keyframes": None, "synchronization": None, "stabilization": None,
+    "output": None,
+    "background_color": None, "background_mode": None,
+    "background_margin": None, "background_margin_feather": None,
+    "playback_speed": None, "muted": None,
+}
+
+
+def preset_from_project(project):
+    """A saved project used as a preset, cut down to what a preset would hold.
+
+    Gyroflow tells the two apart by "videofile", and a preset that has one swaps
+    every clip it is applied to for that video -- each render would be the clip
+    the project was made from. The project's motion data, sync offsets and trim
+    are that clip's too, so they go with it."""
+    preset = {}
+    for key, sub in PRESET_KEYS.items():
+        if key not in project:
+            continue
+        value = project[key]
+        if sub is not None and isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k in sub}
+        preset[key] = value
+    return preset
+
 
 def make_intermediate_preset(preset, work, trim_end=0):
     """Same preset with the output block dropped -- the ProRes settings are
@@ -1375,6 +1410,10 @@ def main():
             "land on one file. Change one, or pass --no-ungraded.")
 
     preset = json.loads(args.preset.read_text(encoding="utf-8"))
+    if preset.get("videofile"):
+        warn(f"{args.preset.name} is a saved project, not a preset; using only its "
+             f"settings, not its video, motion data, offsets or trim")
+        preset = preset_from_project(preset)
     out_block = preset.get("output")
     if not out_block:
         die(f"{args.preset.name} has no 'output' block.\n"

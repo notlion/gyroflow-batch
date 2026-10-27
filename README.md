@@ -107,7 +107,9 @@ grades them with a D-Log M → Rec.709 LUT, in a single lossy encode.
    DNxHD or CineForm), bitrate, resolution and audio.
 3. Turn **Export trims separately** off.
 4. Save the preset with the **Export settings** group ticked, and put the
-   `.gyroflow` file in your footage folder.
+   `.gyroflow` file in your footage folder. A saved project works too: the
+   script keeps its settings and ignores its video, motion data, offsets and
+   trim.
 
 ---
 
