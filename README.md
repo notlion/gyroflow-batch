@@ -1,14 +1,14 @@
-# stabilize-and-grade
+# Gyroflow Batch
 
-Stabilize DJI footage with Gyroflow and apply a D-Log M → Rec.709 LUT in a
-**single lossy encode**.
+Gyroflow Batch stabilizes DJI footage with Gyroflow and applies a D-Log M →
+Rec.709 LUT in a **single lossy encode**.
 
-You configure everything once in Gyroflow's GUI and save a normal preset. The
-script splits that preset in two: your delivery settings (codec, bitrate, size,
-audio, keyframe distance) drive the final ffmpeg encode, while a derived copy
-sends Gyroflow's render into a named pipe as ProRes. One ffmpeg reads that pipe
-once and writes two deliveries — the graded one through the 3D LUT, and a
-stabilized-but-ungraded copy of the log original.
+You configure everything once in Gyroflow's GUI and save a normal preset.
+Gyroflow Batch splits that preset in two: your delivery settings (codec,
+bitrate, size, audio, keyframe distance) drive the final ffmpeg encode, while a
+derived copy sends Gyroflow's render into a named pipe as ProRes. One ffmpeg
+reads that pipe once and writes two deliveries — the graded one through the 3D
+LUT, and a stabilized-but-ungraded copy of the log original.
 
 The source is decoded once, Gyroflow renders once, nothing is encoded twice, and
 no multi-hundred-gigabyte intermediate file ever touches the disk.
@@ -34,9 +34,9 @@ See [Clips with nothing to stabilize](#clips-with-nothing-to-stabilize-are-grade
 | Gyroflow | on macOS, **the direct download, not the Mac App Store build** (see below) |
 | mp4_merge | only for recordings split into several files — Gyroflow's merge tool (see below) |
 
-On Windows the script works with one difference: it renders through a temporary
-file rather than a pipe, so it needs about 100 GB of free space per clip on the
-work drive. See [Running on Windows](#running-on-windows).
+On Windows Gyroflow Batch works with one difference: it renders through a
+temporary file rather than a pipe, so it needs about 100 GB of free space per
+clip on the work drive. See [Running on Windows](#running-on-windows).
 
 ---
 
@@ -57,8 +57,8 @@ If that errors or offers to install developer tools, run:
 xcode-select --install
 ```
 
-Any Python 3.8+ works. The script imports only the standard library, so there is
-no virtualenv and no dependency list.
+Any Python 3.8+ works. Gyroflow Batch imports only the standard library, so
+there is no virtualenv and no dependency list.
 
 ### 2. Homebrew
 
@@ -83,8 +83,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"
 brew install ffmpeg
 ```
 
-This installs `ffprobe` too. Both must be on your `PATH`; the script refuses to
-start otherwise. Confirm the two pieces it depends on are present:
+This installs `ffprobe` too. Both must be on your `PATH`; Gyroflow Batch refuses
+to start otherwise. Confirm the two pieces it depends on are present:
 
 ```sh
 ffmpeg -hide_banner -filters  | grep lut3d
@@ -98,8 +98,8 @@ into `/Applications`.
 
 > **Do not install Gyroflow from the Mac App Store.**
 > The App Store build is sandboxed, and the sandbox blocks its command-line
-> interface from reading anything outside its own container — including this
-> script's work directory. It fails with exit code 101 and a `PermissionDenied`
+> interface from reading anything outside its own container — including Gyroflow
+> Batch's work directory. It fails with exit code 101 and a `PermissionDenied`
 > panic, which no amount of configuration will fix. Only the direct download
 > works.
 
@@ -110,7 +110,7 @@ or clear the quarantine flag:
 xattr -dr com.apple.quarantine /Applications/Gyroflow.app
 ```
 
-Confirm the CLI binary is where the script expects it:
+Confirm the CLI binary is where Gyroflow Batch expects it:
 
 ```sh
 ls /Applications/Gyroflow.app/Contents/MacOS/gyroflow
@@ -122,18 +122,19 @@ Installed somewhere else? Pass `--gyroflow /path/to/Gyroflow.app/Contents/MacOS/
 
 Only needed if your camera splits long recordings into several files. From
 <https://github.com/gyroflow/mp4-merge/releases> download `mp4_merge-mac-arm64`
-(Apple silicon) or `mp4_merge-mac64` (Intel) and put it next to the script. It
-is found there under its downloaded name. Then let it run:
+(Apple silicon) or `mp4_merge-mac64` (Intel) and put it next to
+`gyroflow-batch.py`. It is found there under its downloaded name. Then let it
+run:
 
 ```sh
 chmod +x mp4_merge-mac-*
 xattr -d com.apple.quarantine mp4_merge-mac-*
 ```
 
-### 6. The script
+### 6. Gyroflow Batch
 
 ```sh
-chmod +x stabilize_and_grade.py
+chmod +x gyroflow-batch.py
 ```
 
 ---
@@ -143,11 +144,11 @@ chmod +x stabilize_and_grade.py
 ### 1. Python
 
 Install Python 3 from <https://www.python.org/downloads/windows/>, or run
-`winget install Python.Python.3.12`. Run the script with the `py` launcher
+`winget install Python.Python.3.12`. Run Gyroflow Batch with the `py` launcher
 instead of `./`:
 
 ```powershell
-py stabilize_and_grade.py --src-dir "D:\Footage\Race Day" --dry-run
+py gyroflow-batch.py --src-dir "D:\Footage\Race Day" --dry-run
 ```
 
 ### 2. ffmpeg
@@ -157,22 +158,22 @@ winget install Gyan.FFmpeg
 ```
 
 Open a new terminal afterwards so `ffmpeg` and `ffprobe` are on your `PATH`.
-That build includes the NVIDIA, Intel and AMD hardware encoders; the script
+That build includes the NVIDIA, Intel and AMD hardware encoders; Gyroflow Batch
 picks whichever one your GPU actually supports — see
 [GPU encoding](#gpu-encoding).
 
 ### 3. Gyroflow
 
 Download the Windows build from <https://gyroflow.xyz> and unzip it to
-`C:\Program Files\Gyroflow`, which is where the script looks for `gyroflow.exe`
-by default (after checking `PATH`). Anywhere else works too — pass
-`--gyroflow "C:\path\to\Gyroflow\gyroflow.exe"`.
+`C:\Program Files\Gyroflow`, which is where Gyroflow Batch looks for
+`gyroflow.exe` by default (after checking `PATH`). Anywhere else works too —
+pass `--gyroflow "C:\path\to\Gyroflow\gyroflow.exe"`.
 
 ### 4. mp4_merge
 
 Only needed if your camera splits long recordings into several files. From
 <https://github.com/gyroflow/mp4-merge/releases> download
-`mp4_merge-windows64.exe` and put it next to the script.
+`mp4_merge-windows64.exe` and put it next to `gyroflow-batch.py`.
 
 ---
 
@@ -191,9 +192,9 @@ In the Gyroflow GUI, load one representative clip and set up lens profile,
 synchronization, and stabilization as you want them. Then open **Export
 settings** and choose your delivery codec, bitrate, resolution, and audio.
 
-When you save the preset, **tick the "Export settings" group**. The script reads
-your delivery settings out of the preset's `output` block and stops with an error
-if that block is missing.
+When you save the preset, **tick the "Export settings" group**. Gyroflow Batch
+reads your delivery settings out of the preset's `output` block and stops with
+an error if that block is missing.
 
 Two settings to check:
 
@@ -210,19 +211,19 @@ The preset's *output folder* is deliberately ignored — see
 ## Running it
 
 `--src-dir` is **required** — it is the folder holding the clips, the preset and
-the LUT. The script lives in this repo rather than beside your footage, so there
-is nothing sensible for it to default to; run it without one and you get this
-help text back.
+the LUT. Gyroflow Batch lives in this repo rather than beside your footage, so
+there is nothing sensible for it to default to; run it without one and you get
+this help text back.
 
 ```sh
-./stabilize_and_grade.py --src-dir "/Volumes/Footage/Race Day"
+./gyroflow-batch.py --src-dir "/Volumes/Footage/Race Day"
 ```
 
 Always start with a dry run — it prints the derived plan and the exact commands
 without touching anything:
 
 ```sh
-./stabilize_and_grade.py --src-dir "/Volumes/Footage/Race Day" --dry-run
+./gyroflow-batch.py --src-dir "/Volumes/Footage/Race Day" --dry-run
 ```
 
 ```
@@ -244,22 +245,22 @@ More examples:
 D="/Volumes/Footage/Race Day"
 
 # just two clips (names are relative to --src-dir)
-./stabilize_and_grade.py --src-dir "$D" "Heat 1.MP4" "Heat 2.MP4"
+./gyroflow-batch.py --src-dir "$D" "Heat 1.MP4" "Heat 2.MP4"
 
 # graded delivery only, no ungraded copy
-./stabilize_and_grade.py --src-dir "$D" --no-ungraded
+./gyroflow-batch.py --src-dir "$D" --no-ungraded
 
 # redo something that already exists
-./stabilize_and_grade.py --src-dir "$D" --overwrite "Heat 1.MP4"
+./gyroflow-batch.py --src-dir "$D" --overwrite "Heat 1.MP4"
 
 # stabilize everything, even clips detected as having no motion data
-./stabilize_and_grade.py --src-dir "$D" --force-stabilize
+./gyroflow-batch.py --src-dir "$D" --force-stabilize
 
 # only merge split recordings, so they can be renamed before stabilizing
-./stabilize_and_grade.py --src-dir "$D" --merge-only
+./gyroflow-batch.py --src-dir "$D" --merge-only
 
 # no FIFO support on the volume? write a real intermediate instead
-./stabilize_and_grade.py --src-dir "$D" --mode file
+./gyroflow-batch.py --src-dir "$D" --mode file
 ```
 
 ### Options
@@ -280,7 +281,7 @@ D="/Volumes/Footage/Race Day"
 | `--rec709` | tag the graded file plain Rec.709 instead of Rec.709-A, and keep H.264/H.265 in `.mp4` |
 | `--merge-only` | merge split recordings and stop; needs no preset, LUT or Gyroflow |
 | `--no-merge` | process the parts of a split recording one by one |
-| `--mp4-merge PATH` | path to the mp4_merge tool (default: on `PATH`, or beside the script) |
+| `--mp4-merge PATH` | path to the mp4_merge tool (default: on `PATH`, or beside `gyroflow-batch.py`) |
 | `--force-stabilize` | stabilize every clip, even where no motion data was found |
 | `--mode file` | write a real ProRes intermediate instead of piping (~100 GB/clip); always on for Windows |
 | `--overwrite` | re-render files that already exist |
@@ -314,13 +315,13 @@ With *Use GPU* ticked in the preset, H.264/H.265 go to a hardware encoder:
 | macOS | VideoToolbox |
 | Windows | the first that works of NVIDIA NVENC, Intel Quick Sync, AMD AMF |
 
-Every ffmpeg build for Windows lists all three, whatever GPU is fitted, so the
-script test-encodes a fraction of a second with each, in that order, using the
-exact settings of the real encode. That also catches a GPU that has the encoder
-but cannot do 10-bit HEVC, as NVIDIA cards older than the GTX 10 series cannot.
-The chosen encoder shows on the `-> ffmpeg:` line of the plan.
+Every ffmpeg build for Windows lists all three, whatever GPU is fitted, so
+Gyroflow Batch test-encodes a fraction of a second with each, in that order,
+using the exact settings of the real encode. That also catches a GPU that has
+the encoder but cannot do 10-bit HEVC, as NVIDIA cards older than the GTX 10
+series cannot. The chosen encoder shows on the `-> ffmpeg:` line of the plan.
 
-If none work, the script warns and encodes in software (`libx265`/`libx264`),
+If none work, Gyroflow Batch warns and encodes in software (`libx265`/`libx264`),
 which gives the same file but is much slower. Unticking *Use GPU* in the preset
 goes straight to software.
 
@@ -338,17 +339,17 @@ the work list every time. Keeping deliveries in a subfolder avoids that entirely
 
 Cameras split a long recording into files of just under 4 GB, the FAT32 limit
 of the SD card. Stabilized one by one, each part would get its own delivery and
-the smoothing would restart at every join. So the script joins each such
+the smoothing would restart at every join. So Gyroflow Batch joins each such
 recording back into one file before anything else.
 
 The merge is done by **mp4_merge**, the tool from the Gyroflow project that
 Gyroflow's own "join the files" prompt uses. Gyroflow's command line cannot
-merge, so the script runs that tool directly. It copies the data without
+merge, so Gyroflow Batch runs that tool directly. It copies the data without
 re-encoding and keeps every track, the motion data included, so the joined
 file stabilizes as one clip.
 
 **How parts are recognised.** Nothing in the files links the parts of a
-recording, so the script uses the same rule as mp4_merge itself: a file
+recording, so Gyroflow Batch uses the same rule as mp4_merge itself: a file
 continues the one before it when its creation time equals that file's, or
 equals that file's plus its duration to within 2 s. It also requires the same
 picture size, frame rate and rotation, which Gyroflow checks before merging
@@ -370,9 +371,9 @@ The merge needs as much free space again as the parts take up.
 **Merging on its own.** To name recordings before stabilizing them:
 
 ```sh
-./stabilize_and_grade.py --src-dir "$D" --merge-only    # merge, then stop
+./gyroflow-batch.py --src-dir "$D" --merge-only    # merge, then stop
 # rename DJI_…_joined.MP4 to "Heat 1.MP4", and so on
-./stabilize_and_grade.py --src-dir "$D"                 # stabilize and grade
+./gyroflow-batch.py --src-dir "$D"                 # stabilize and grade
 ```
 
 `--merge-only` needs no preset, LUT or Gyroflow, only ffmpeg and mp4_merge.
@@ -388,14 +389,14 @@ merging off and processes every file on its own.
 
 Not every clip needs Gyroflow. Footage from a mechanically gimballed drone is
 already steady, and running it through a stabilization pass costs a full extra
-render to change nothing. The script detects this **per clip** and skips the
+render to change nothing. Gyroflow Batch detects this **per clip** and skips the
 Gyroflow half when there is nothing to work with.
 
 **How it decides.** DJI writes telemetry into a `djmd` data track — protobuf,
 with a different schema per camera (`dvtm_O4P.proto`, `dvtm_Mini5Pro.proto`, …).
-Rather than model those, the script reads three seconds of that track and counts
-one thing: unit quaternions. What matters is not whether orientation data exists
-but **how fast it arrives**:
+Rather than model those, Gyroflow Batch reads three seconds of that track and
+counts one thing: unit quaternions. What matters is not whether orientation data
+exists but **how fast it arrives**:
 
 | Camera | Orientation samples | vs 59.94 fps | Verdict |
 |---|---|---|---|
@@ -515,10 +516,10 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 "Heat 1 Stabilized Gr
 
 ### The work directory must support named pipes
 
-The default mode on macOS renders through a FIFO, which needs a real filesystem. APFS and
-HFS+ are fine. **exFAT, FAT, and most network shares are not** — the script
-detects this up front and tells you. Either point `--work` at an APFS/HFS+
-location that Gyroflow can read, or fall back to `--mode file`.
+The default mode on macOS renders through a FIFO, which needs a real filesystem.
+APFS and HFS+ are fine. **exFAT, FAT, and most network shares are not** —
+Gyroflow Batch detects this up front and tells you. Either point `--work` at an
+APFS/HFS+ location that Gyroflow can read, or fall back to `--mode file`.
 
 ### Disk space
 
@@ -527,10 +528,10 @@ full ProRes intermediate, roughly **100 GB per clip** — check free space first
 
 ### Sleep
 
-The script holds a `caffeinate` power assertion for the duration of the run, so
-the Mac will not idle-sleep partway through a long batch (on Windows, the
-equivalent system power request). The assertion is tied
-to the process ID, so it is released even if the script is killed outright.
+Gyroflow Batch holds a `caffeinate` power assertion for the duration of the run,
+so the Mac will not idle-sleep partway through a long batch (on Windows, the
+equivalent system power request). The assertion is tied to the process ID, so it
+is released even if Gyroflow Batch is killed outright.
 
 Two limits: the assertion against system sleep only applies on AC power, and
 **closing the lid still sleeps the machine** no matter what.
@@ -545,7 +546,7 @@ Two limits: the assertion against system sleep only applies on AC power, and
 | `has no 'output' block` | Preset saved without the **Export settings** group ticked. |
 | `no .cube file in …` | LUT missing from `--src-dir`, or pass `--lut` explicitly. |
 | A clip was graded but not stabilized | Its telemetry had no sub-frame motion data — check the `stabilize:` line. `--force-stabilize` overrides. |
-| `the mp4_merge tool was not found` | Download it from the mp4-merge releases page and put it beside the script, or pass `--mp4-merge`. `--no-merge` skips merging. |
+| `the mp4_merge tool was not found` | Download it from the mp4-merge releases page and put it beside `gyroflow-batch.py`, or pass `--mp4-merge`. `--no-merge` skips merging. |
 | `merge failed` | The parts could not be joined, e.g. a part is damaged or from an unfinished recording. The parts are left as they were. |
 | A file stayed in the folder after merging | It was already in `Split parts`, so it was not moved over the other copy. Move it out of the way before the next run. |
 | `cannot create a named pipe` | Work directory is on exFAT or a network share. Use `--work` or `--mode file`. |

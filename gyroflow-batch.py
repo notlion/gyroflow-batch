@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Stabilize (Gyroflow) + grade (D-Log M -> Rec.709 LUT) with ONE lossy encode.
+Gyroflow Batch: stabilize (Gyroflow) + grade (D-Log M -> Rec.709 LUT) with ONE
+lossy encode.
 
 You configure everything in Gyroflow's GUI and save a normal preset -- including
 the "Export settings" group. This script then splits that preset in two:
@@ -46,13 +47,13 @@ applied. A clip whose telemetry cannot be read is always stabilized, since
 skipping one that needed it is far worse than running one that did not.
 
 Usage:
-    ./stabilize_and_grade.py --src-dir DIR                    # every .mp4 there
-    ./stabilize_and_grade.py --src-dir DIR "ESK8 Heat 1.MP4"  # just these
-    ./stabilize_and_grade.py --src-dir DIR --dry-run          # the derived plan
-    ./stabilize_and_grade.py --src-dir DIR --no-ungraded      # graded only
-    ./stabilize_and_grade.py --src-dir DIR --force-stabilize  # stabilize regardless
-    ./stabilize_and_grade.py --src-dir DIR --merge-only       # join split recordings
-    ./stabilize_and_grade.py --src-dir DIR --mode file        # on disk instead
+    ./gyroflow-batch.py --src-dir DIR                    # every .mp4 there
+    ./gyroflow-batch.py --src-dir DIR "ESK8 Heat 1.MP4"  # just these
+    ./gyroflow-batch.py --src-dir DIR --dry-run          # the derived plan
+    ./gyroflow-batch.py --src-dir DIR --no-ungraded      # graded only
+    ./gyroflow-batch.py --src-dir DIR --force-stabilize  # stabilize regardless
+    ./gyroflow-batch.py --src-dir DIR --merge-only       # join split recordings
+    ./gyroflow-batch.py --src-dir DIR --mode file        # on disk instead
 """
 
 import argparse
