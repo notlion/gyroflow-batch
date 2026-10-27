@@ -28,8 +28,9 @@ Why a pipe works (verified against Gyroflow's source):
     non-seekable pipe
   * it hands the path straight to FFmpeg's avformat, with no seekable wrapper
 
---src-dir is required and holds the clips, the .gyroflow preset and the .cube
-LUT. Deliveries land in <src-dir>/Stabilized.
+--src-dir is required and holds the clips and the .gyroflow preset. Grading is
+opt-in: --lut names the .cube to grade with, and without it only the stabilized,
+ungraded delivery is written. Deliveries land in <src-dir>/Stabilized.
 
 A recording the camera split into several files is first joined back into one
 with mp4-merge, the tool behind Gyroflow's own merge: losslessly, motion data
@@ -47,11 +48,13 @@ applied. A clip whose telemetry cannot be read is always stabilized, since
 skipping one that needed it is far worse than running one that did not.
 
 Usage:
-    ./gyroflow-batch.py --src-dir DIR                    # every .mp4 there
+    ./gyroflow-batch.py --src-dir DIR                    # stabilize every .mp4 there
+    ./gyroflow-batch.py --src-dir DIR --lut LUT.cube     # ...and grade them
     ./gyroflow-batch.py --src-dir DIR "ESK8 Heat 1.MP4"  # just these
     ./gyroflow-batch.py --src-dir DIR --dry-run          # the derived plan
     ./gyroflow-batch.py --src-dir DIR --no-ungraded      # graded only
     ./gyroflow-batch.py --src-dir DIR --force-stabilize  # stabilize regardless
+    ./gyroflow-batch.py --src-dir DIR --trim-end 5       # drop the landing
     ./gyroflow-batch.py --src-dir DIR --merge-only       # join split recordings
     ./gyroflow-batch.py --src-dir DIR --mode file        # on disk instead
 """
@@ -452,7 +455,9 @@ Part = collections.namedtuple("Part", "created duration picture")
 
 def probe_part(path):
     """What tells one split recording's files apart: (creation time, duration,
-    picture). Raises ValueError saying why when ffprobe cannot tell.
+    picture). None for a file with no creation time -- normal for one that did
+    not come straight off a camera, and never part of a split recording here.
+    Raises ValueError saying why when ffprobe cannot read the file.
 
     Asks for whole sections rather than -show_entries with the rotation in it:
     the name of the side-data section has not been the same in every ffprobe,
@@ -472,7 +477,7 @@ def probe_part(path):
         raise ValueError(f"unreadable ffprobe output ({e!r})")
     stamp = (fmt.get("tags") or {}).get("creation_time")
     if not stamp:
-        raise ValueError("no creation time")
+        return None
     try:
         created = datetime.datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
         duration = float(fmt["duration"])
@@ -492,7 +497,7 @@ def continues(a, b):
     """Whether part b is the next file of the recording part a belongs to, and if
     not, why not."""
     if a is None or b is None:
-        return False, "could not be read"
+        return False, "no creation time to go by, or could not be read"
     if a.picture != b.picture:
         return False, f"different picture: {a.picture} vs {b.picture}"
     since = b.created - a.created
@@ -944,12 +949,28 @@ def build_filter_complex(lut, kinds):
 
 # --------------------------------------------------------------- the two ends
 
-def make_intermediate_preset(preset, work):
+# Every way a Gyroflow preset or project has spelled its trims: trim_ranges_ms
+# now, trim_ranges (fractions of the clip) and trim_start/trim_end before that.
+TRIM_KEYS = ("trim_ranges_ms", "trim_ranges", "trim_start", "trim_end")
+
+
+def make_intermediate_preset(preset, work, trim_end=0):
     """Same preset with the output block dropped -- the ProRes settings are
     passed via -p instead, which keeps Gyroflow's apply_to_all path (and its
-    filename regeneration) out of the picture entirely."""
+    filename regeneration) out of the picture entirely.
+
+    trim_end cuts that many seconds off the end of every clip Gyroflow renders.
+    Gyroflow reads a negative end in trim_ranges_ms as counted back from the end
+    of the clip, so one preset serves clips of any length. And it is a real trim
+    rather than a cut afterwards: the zoom is fitted to the frames inside the
+    range only, so a rough landing no longer sets the crop for the whole flight.
+    """
     derived = {k: v for k, v in preset.items() if k != "output"}
     derived["name"] = f"{preset.get('name', 'preset')} (intermediate)"
+    if trim_end:
+        for key in TRIM_KEYS:
+            derived.pop(key, None)
+        derived["trim_ranges_ms"] = [[0, -round(trim_end * 1000)]]
     path = work / f"intermediate-{RUN_ID}.gyroflow"
     path.write_text(json.dumps(derived, indent=4, sort_keys=True))
     return path
@@ -995,14 +1016,26 @@ def run_one(src, args, out_block, inter_preset, work, decision):
             f"encode to save. Render those straight from Gyroflow instead.")
     fps, has_audio, seconds = probe(src)
     stabilize, rate = decision
+    grade = args.lut is not None
     if not stabilize:
-        info(f"no motion data to stabilize with — {rate:.0f} orientation samples/s "
-             f"at {fps:.2f} fps is one per frame; grading only")
+        why = (f"no motion data to stabilize with — {rate:.0f} orientation samples/s "
+               f"at {fps:.2f} fps is one per frame")
+        if not grade:
+            info(f"{why}, and no --lut to grade with; nothing to do")
+            return "skipped"
+        info(f"{why}; grading only")
+    elif args.trim_end and seconds and seconds <= args.trim_end:
+        warn(f"{src.name} runs {seconds:.1f} s, so trimming {args.trim_end:g} s off "
+             f"its end would leave nothing; skipping it")
+        return "skipped"
 
     # A clip that is not stabilized must not be named as though it were, and its
-    # ungraded copy would be a plain transcode of the source.
-    targets = [("graded", args.out_dir /
-                f"{stem}{args.suffix if stabilize else args.unstabilized_suffix}{ext}")]
+    # ungraded copy would be a plain transcode of the source. Without a LUT there
+    # is only the ungraded copy.
+    targets = []
+    if grade:
+        targets.append(("graded", args.out_dir /
+                        f"{stem}{args.suffix if stabilize else args.unstabilized_suffix}{ext}"))
     if args.ungraded and stabilize:
         targets.append(("plain", args.out_dir / f"{stem}{args.ungraded_suffix}{ext}"))
 
@@ -1155,20 +1188,24 @@ def main():
                '      show the derived plan without touching anything\n'
                '\n'
                '  %(prog)s --src-dir "/Volumes/Footage/Race Day"\n'
-               '      stabilize and grade every .mp4 there, writing both\n'
-               '      deliveries into "/Volumes/Footage/Race Day/Stabilized"\n',
+               '      stabilize every .mp4 there into\n'
+               '      "/Volumes/Footage/Race Day/Stabilized"\n'
+               '\n'
+               '  %(prog)s --src-dir "/Volumes/Footage/Race Day" --lut "D-Log M to Rec.709.cube"\n'
+               '      the same, plus a graded delivery beside each one\n',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("files", nargs="*", type=Path,
                    help="specific clips (default: every .mp4 in --src-dir)")
     p.add_argument("--src-dir", type=Path, default=None,
-                   help="REQUIRED: folder holding the clips, the .gyroflow preset "
-                        "and the .cube LUT")
+                   help="REQUIRED: folder holding the clips and the .gyroflow preset")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="default: <src-dir>/Stabilized")
     p.add_argument("--preset", type=Path, default=None,
                    help="default: the only .gyroflow file in --src-dir")
     p.add_argument("--lut", type=Path, default=None,
-                   help="default: the only .cube file in --src-dir")
+                   help="the .cube LUT to grade with. Without it nothing is graded: "
+                        "stabilized clips get only the ungraded delivery, and clips "
+                        "with nothing to stabilize are skipped")
     p.add_argument("--gyroflow", type=Path,
                    default=default_gyroflow(),
                    help="the Gyroflow CLI binary -- on macOS the one inside the app "
@@ -1198,6 +1235,12 @@ def main():
                         "correctly; since that atom is QuickTime-only, those codecs are "
                         "delivered in .mov. The ungraded copy is plain Rec.709 either "
                         "way, matching the tag the camera wrote")
+    p.add_argument("--trim-end", type=float, default=0, metavar="SECONDS",
+                   help="cut this many seconds off the end of every clip that is "
+                        "stabilized, e.g. a drone's landing. Gyroflow fits its zoom "
+                        "to what is left, so fast movement there no longer crops the "
+                        "whole clip in tighter. Replaces any trim in the preset. Clips "
+                        "that are only graded are not trimmed")
     p.add_argument("--force-stabilize", action="store_true",
                    help="run Gyroflow for every clip even where no motion data was "
                         "found. Whether to stabilize is otherwise decided per clip: one "
@@ -1290,13 +1333,16 @@ def main():
 
     if args.preset is None:
         args.preset = find_one(args.src_dir, ".gyroflow", "--preset")
-    if args.lut is None:
-        args.lut = find_one(args.src_dir, ".cube", "--lut")
     if not args.preset.is_file():
         die(f"preset not found: {args.preset}")
-    if not args.lut.is_file():
+    if args.lut is not None and not args.lut.is_file():
         die(f"LUT not found: {args.lut}")
-    if args.ungraded and args.ungraded_suffix == args.suffix:
+    if args.lut is None and not args.ungraded:
+        die("--no-ungraded without --lut leaves nothing to write: the ungraded copy is "
+            "the only delivery when nothing is graded.")
+    if args.trim_end < 0:
+        die("--trim-end must be zero or more seconds")
+    if args.lut and args.ungraded and args.ungraded_suffix == args.suffix:
         die("--suffix and --ungraded-suffix are the same, so the two renders would "
             "land on one file. Change one, or pass --no-ungraded.")
 
@@ -1361,14 +1407,18 @@ def main():
             check_fifo_support(args.work)
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    inter_preset = make_intermediate_preset(preset, args.work) if stabilizing else None
+    if stabilizing and args.trim_end and any(k in preset for k in TRIM_KEYS):
+        warn(f"{args.preset.name} has a trim of its own; --trim-end replaces it")
+    inter_preset = (make_intermediate_preset(preset, args.work, args.trim_end)
+                    if stabilizing else None)
 
     # ---- show the derived plan; this is the bit worth eyeballing. Everything
     # downstream of "stabilize" is decided per clip, so this shows the first one.
     fps, _, _ = probe(files[0])
     stabilize, rate = decisions.get(files[0], (True, None))
     info(f"preset:       {args.preset.name}")
-    info(f"lut:          {args.lut.name}")
+    grade = args.lut is not None
+    info(f"lut:          " + (args.lut.name if grade else "none — not grading (pass --lut to grade)"))
     if args.force_stabilize:
         motion = "on for every clip (--force-stabilize)"
     elif rate is None:
@@ -1389,17 +1439,22 @@ def main():
          f"{out_block.get('codec_options') or ''} @ {out_block.get('bitrate', 0):.2f} Mbps, "
          f"{size}, gpu={out_block.get('use_gpu')}")
     info(f"  -> ffmpeg:  {shlex.join(build_video_args(out_block, fps))}")
-    info(f"  -> color:   " + ("Rec.709 (--rec709)" if not args.rec709a else
+    info(f"  -> color:   " + ("Rec.709, ungraded" if not grade else
+                              "Rec.709 (--rec709)" if not args.rec709a else
                               "graded Rec.709-A (gama 1.96)"
                               + (", ungraded Rec.709" if args.ungraded and stabilize else "")))
+    if args.trim_end:
+        info(f"trim:         last {args.trim_end:g} s of every stabilized clip")
     info(f"intermediate: " + (f"ProRes {args.prores} through a {args.mode}" if stabilize
-                              else "none — the LUT only, Gyroflow not run"))
+                              else "none — the LUT only, Gyroflow not run" if grade
+                              else "none — nothing to stabilize or grade, clip skipped"))
     # Names for the first clip, which is what the rest are patterned on.
     ext = container_ext(out_block.get("codec", "H.265/HEVC"), args.rec709a) or ""
     info(f"output:       {args.out_dir}"
          + (f"  (first of {len(files)} clips shown)" if len(files) > 1 else ""))
-    info(f"  graded:     {files[0].stem}"
-         f"{args.suffix if stabilize else args.unstabilized_suffix}{ext}")
+    info(f"  graded:     " + (f"{files[0].stem}"
+                              f"{args.suffix if stabilize else args.unstabilized_suffix}{ext}"
+                              if grade else "off (no --lut)"))
     info(f"  ungraded:   " + (f"{files[0].stem}{args.ungraded_suffix}{ext}"
                               if args.ungraded and stabilize
                               else "off (not stabilized)" if not stabilize
