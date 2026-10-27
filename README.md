@@ -67,18 +67,35 @@ grades them with a D-Log M → Rec.709 LUT, in a single lossy encode.
 
 ## Install on Windows
 
-1. **Python** from <https://www.python.org/downloads/windows/>, or
-   `winget install Python.Python.3.12`.
-2. **ffmpeg:** `winget install Gyan.FFmpeg`, then open a new terminal.
-3. **Gyroflow.** Download the Windows build from <https://gyroflow.xyz> and unzip
-   it to `C:\Program Files\Gyroflow`. Elsewhere works too: pass
-   `--gyroflow "C:\path\to\gyroflow.exe"`.
+1. **Python.** Check with `py --version`. If that fails, install it from
+   <https://www.python.org/downloads/windows/>, or run:
+
+   ```powershell
+   winget install Python.Python.3.12
+   ```
+
+2. **ffmpeg** (includes ffprobe):
+
+   ```powershell
+   winget install Gyan.FFmpeg
+   ```
+
+   Then open a new terminal so `ffmpeg` is on your `PATH`.
+
+3. **Gyroflow.** Download the Windows `.zip` from <https://gyroflow.xyz> and
+   unzip it to `C:\Program Files\Gyroflow`. If you unzip it somewhere else, pass
+   `--gyroflow "C:\path\to\gyroflow.exe"` when you run the script.
+
 4. **mp4_merge** (only for split recordings). From
    <https://github.com/gyroflow/mp4-merge/releases> download
    `mp4_merge-windows64.exe` and put it next to `gyroflow-batch.py`.
 
-On Windows, run the script with `py gyroflow-batch.py …` instead of
-`./gyroflow-batch.py …`.
+5. **Gyroflow Batch.** Run it with the `py` launcher. Wherever this README shows
+   `./gyroflow-batch.py`, use:
+
+   ```powershell
+   py gyroflow-batch.py --src-dir "D:\Footage\Race Day"
+   ```
 
 ---
 
