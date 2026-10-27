@@ -50,6 +50,7 @@ Usage:
 """
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -66,8 +67,24 @@ from pathlib import Path
 # invocations sharing a work directory cannot unlink each other's pipes.
 RUN_ID = os.getpid()
 
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = os.name == "nt"
+
 
 # --------------------------------------------------------------- pretty output
+
+def enable_windows_ansi():
+    """Windows 10+ consoles understand the colour and erase-line escapes used
+    here, but the classic console window only once a process asks for them."""
+    if not IS_WINDOWS:
+        return
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    for std_handle in (-11, -12):                    # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+        handle = kernel32.GetStdHandle(std_handle)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # VIRTUAL_TERMINAL_PROCESSING
 
 def _c(stream, code, text):
     """Colour only when that stream is a terminal, so redirected logs stay clean."""
@@ -116,6 +133,54 @@ def container_ext(codec, rec709a=False):
     return ".mov" if rec709a else ".mp4"
 
 
+def hw_encoder_args(name):
+    """ffmpeg args for one hardware encoder, e.g. hevc_nvenc or h264_qsv."""
+    hevc = name.startswith("hevc_")
+    args = ["-c:v", name]
+    if hevc:
+        args += ["-profile:v", "main10"]
+    if name == "hevc_videotoolbox":
+        args += ["-allow_sw", "1"]
+    if name.endswith("_videotoolbox"):
+        args += ["-pix_fmt", "yuv420p10le" if hevc else "yuv420p"]
+    else:
+        # NVENC, Quick Sync and AMF take semi-planar input only
+        args += ["-pix_fmt", "p010le" if hevc else "nv12"]
+    return args
+
+
+@functools.lru_cache(maxsize=None)
+def hardware_encoder(codec):
+    """The hardware encoder for codec ("hevc" or "h264") on this machine, or None.
+
+    A Mac always has VideoToolbox. Anywhere else the GPU vendor is not known in
+    advance, and asking ffmpeg is no help: a stock build lists NVENC, Quick Sync
+    and AMF whether or not the hardware behind them exists. So each is tried
+    with a fraction of a second of black frames, using the exact args the real
+    encode will -- which also catches a GPU that has the encoder but not its
+    10-bit profile, as NVIDIA cards older than Pascal do for HEVC.
+    """
+    if IS_MAC:
+        return f"{codec}_videotoolbox"
+    for family in ("nvenc", "qsv", "amf"):
+        name = f"{codec}_{family}"
+        try:
+            ok = subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error",
+                 "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2"]
+                + hw_encoder_args(name) + ["-f", "null", "-"],
+                capture_output=True, timeout=30).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        if ok:
+            return name
+    software = "libx265" if codec == "hevc" else "libx264"
+    warn(f"no working GPU encoder for {codec.upper()} (tried NVIDIA NVENC, Intel "
+         f"Quick Sync, AMD AMF);\n      encoding with {software} instead, which "
+         f"is much slower")
+    return None
+
+
 def build_video_args(out, fps):
     """Translate a Gyroflow `output` block into the final ffmpeg encoder args."""
     codec = out.get("codec", "H.265/HEVC")
@@ -124,18 +189,20 @@ def build_video_args(out, fps):
     args = []
 
     if codec == "H.265/HEVC":
-        if gpu:
-            args += ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-allow_sw", "1"]
+        hw = hardware_encoder("hevc") if gpu else None
+        if hw:
+            args += hw_encoder_args(hw)
         else:
-            args += ["-c:v", "libx265", "-preset", "medium"]
-        args += ["-pix_fmt", "yuv420p10le", "-tag:v", "hvc1"]
+            args += ["-c:v", "libx265", "-preset", "medium", "-pix_fmt", "yuv420p10le"]
+        args += ["-tag:v", "hvc1"]
 
     elif codec == "H.264/AVC":
         # H.264 is 8-bit here; Gyroflow itself steers 10-bit sources to HEVC.
-        args += ["-c:v", "h264_videotoolbox" if gpu else "libx264"]
-        if not gpu:
-            args += ["-preset", "medium"]
-        args += ["-pix_fmt", "yuv420p"]
+        hw = hardware_encoder("h264") if gpu else None
+        if hw:
+            args += hw_encoder_args(hw)
+        else:
+            args += ["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p"]
 
     elif codec == "ProRes":
         prof = PRORES_PROFILE.get(variant, "3")
@@ -191,7 +258,7 @@ def probe(path):
             ["ffprobe", "-v", "error", "-show_entries",
              "stream=codec_type,r_frame_rate:format=duration",
              "-of", "json", str(path)],
-            capture_output=True, text=True, check=True).stdout
+            capture_output=True, encoding="utf-8", errors="replace", check=True).stdout
         probed = json.loads(raw)
         streams = probed.get("streams", [])
     except (subprocess.CalledProcessError, json.JSONDecodeError):
@@ -313,7 +380,7 @@ def orientation_rate(src):
         raw = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_tag_string",
              "-of", "json", str(src)],
-            capture_output=True, text=True, check=True).stdout
+            capture_output=True, encoding="utf-8", errors="replace", check=True).stdout
         streams = json.loads(raw).get("streams", [])
     except (subprocess.CalledProcessError, json.JSONDecodeError):
         return None
@@ -393,9 +460,9 @@ def run_gyroflow(cmd, log_path, verbose):
 
     tty = sys.stdout.isatty()
     drew = False
-    with log_path.open("w", errors="replace") as log:
+    with log_path.open("w", encoding="utf-8", errors="replace") as log:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
-                                text=True, errors="replace")
+                                encoding="utf-8", errors="replace")
         try:
             while True:
                 line = proc.stdout.readline()
@@ -450,9 +517,9 @@ def run_ffmpeg(cmd, log_path, seconds):
     cmd = cmd[:1] + ["-progress", "pipe:1"] + cmd[1:]
     started = time.monotonic()
     drew = False
-    with log_path.open("w", errors="replace") as log:
+    with log_path.open("w", encoding="utf-8", errors="replace") as log:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
-                                text=True, errors="replace")
+                                encoding="utf-8", errors="replace")
         try:
             for line in proc.stdout:
                 m = FF_TIME_RE.match(line)
@@ -481,7 +548,7 @@ def run_ffmpeg(cmd, log_path, seconds):
 
 def dump_log(path, label, limit=40):
     if path.exists() and path.stat().st_size:
-        lines = path.read_text(errors="replace").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         if len(lines) > limit:
             print(f"    {label}| … {len(lines) - limit} earlier lines omitted",
                   file=sys.stderr)
@@ -509,7 +576,7 @@ def find_one(folder, suffix, flag):
 
 
 def gyroflow_failure_hint(rc):
-    if rc == 101:
+    if rc == 101 and IS_MAC:
         warn("exit 101 is a Gyroflow panic. If the trace says PermissionDenied, you are\n"
              "      running the sandboxed Mac App Store build — its sandbox blocks the CLI\n"
              "      from reading files outside its own container, including this script's\n"
@@ -541,7 +608,17 @@ def prevent_sleep():
     Display sleep is left alone -- the screen can go dark overnight without
     touching the render. Add "-d" if you want it awake too. Note that -s only
     applies on AC power, and closing the lid still sleeps the machine.
+
+    Windows gives the same guarantee natively: the request belongs to this
+    thread and lapses when the process exits, however it exits.
     """
+    if IS_WINDOWS:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        if ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED):
+            return True
+        warn("could not hold off sleep; the machine may sleep mid-render")
+        return None
     if not shutil.which("caffeinate"):
         warn("caffeinate not on PATH; the machine may sleep mid-render")
         return None
@@ -551,6 +628,25 @@ def prevent_sleep():
     except OSError as e:
         warn(f"could not start caffeinate ({e}); the machine may sleep mid-render")
         return None
+
+
+def default_gyroflow():
+    """Where the Gyroflow CLI usually lives. The Mac app installs to one place;
+    the Windows download is a zip that can be unpacked anywhere, so PATH is
+    asked first and Program Files is only the guess after that."""
+    if IS_MAC:
+        return Path("/Applications/Gyroflow.app/Contents/MacOS/gyroflow")
+    found = shutil.which("gyroflow")
+    if found:
+        return Path(found)
+    if IS_WINDOWS:
+        return Path(os.environ.get("ProgramFiles", r"C:\Program Files"), "Gyroflow", "gyroflow.exe")
+    return Path("/usr/local/bin/gyroflow")
+
+
+GYROFLOW_EXAMPLE = ("/path/to/Gyroflow.app/Contents/MacOS/gyroflow" if IS_MAC
+                    else r"C:\path\to\Gyroflow\gyroflow.exe" if IS_WINDOWS
+                    else "/path/to/gyroflow")
 
 
 def escape_filter_path(p):
@@ -602,10 +698,18 @@ def make_intermediate_preset(preset, work):
     return path
 
 
+def folder_url(folder):
+    """The file:// URL Gyroflow takes as its output folder, unencoded, as it has
+    always been handed one. A Windows path needs forward slashes and a third
+    slash ahead of its drive letter: file:///C:/Users/..., not file://C:\\Users."""
+    path = folder.as_posix()
+    return "file://" + (path if path.startswith("/") else "/" + path)
+
+
 def make_out_params(out, work, filename, prores_variant):
     """Gyroflow's -p JSON: ProRes into the pipe, at the preset's output size."""
     params = {
-        "output_folder": f"file://{work}",
+        "output_folder": folder_url(work),
         "output_filename": filename,
         "codec": "ProRes",
         "codec_options": prores_variant,
@@ -784,6 +888,7 @@ def run_one(src, args, out_block, inter_preset, work, decision):
 # --------------------------------------------------------------------- main
 
 def main():
+    enable_windows_ansi()
     p = argparse.ArgumentParser(
         description="Gyroflow stabilization + LUT grade in a single delivery encode.",
         # Shown whenever --src-dir is missing, which includes running with no
@@ -808,9 +913,9 @@ def main():
     p.add_argument("--lut", type=Path, default=None,
                    help="default: the only .cube file in --src-dir")
     p.add_argument("--gyroflow", type=Path,
-                   default=Path("/Applications/Gyroflow.app/Contents/MacOS/gyroflow"),
-                   help="the Gyroflow CLI binary inside the app bundle "
-                        "(default: %(default)s)")
+                   default=default_gyroflow(),
+                   help="the Gyroflow CLI binary -- on macOS the one inside the app "
+                        "bundle, on Windows gyroflow.exe (default: %(default)s)")
     p.add_argument("--work", type=Path, default=None,
                    help="where the pipe and derived preset live; must support FIFOs "
                         "(exFAT and most network shares do not). "
@@ -844,8 +949,10 @@ def main():
                         "directly. Use this if a camera logs its motion somewhere this "
                         "script cannot read, and clips are being graded without being "
                         "stabilized")
-    p.add_argument("--mode", default="pipe", choices=["pipe", "file"],
-                   help="'file' writes a real ProRes intermediate (needs ~100 GB/clip)")
+    p.add_argument("--mode", default=None, choices=["pipe", "file"],
+                   help="'file' writes a real ProRes intermediate (needs ~100 GB/clip). "
+                        "Default: pipe, except on Windows, which has no FIFOs and "
+                        "always uses file")
     p.add_argument("--overwrite", action="store_true",
                    help="re-render deliveries that already exist. Without it each of the "
                         "two is skipped on its own, and the check is existence only — a "
@@ -864,6 +971,15 @@ def main():
     if args.src_dir is None:
         p.print_help()
         sys.exit(2)
+
+    # Pipe mode is built on a POSIX FIFO. Windows named pipes are another thing
+    # entirely -- a server has to create each one, and Gyroflow cannot be aimed
+    # at one as its output folder -- so there the render goes through a file.
+    if args.mode is None:
+        args.mode = "pipe" if hasattr(os, "mkfifo") else "file"
+    elif args.mode == "pipe" and not hasattr(os, "mkfifo"):
+        die("--mode pipe needs a FIFO, which Windows does not have. Use --mode file "
+            "(the default here).")
 
     # Absolute from here on. Gyroflow is handed the work directory as a file://
     # URL, and "file://.gyroflow-work" is a host name to a URL parser, not a
@@ -893,7 +1009,7 @@ def main():
         die("--suffix and --ungraded-suffix are the same, so the two renders would "
             "land on one file. Change one, or pass --no-ungraded.")
 
-    preset = json.loads(args.preset.read_text())
+    preset = json.loads(args.preset.read_text(encoding="utf-8"))
     out_block = preset.get("output")
     if not out_block:
         die(f"{args.preset.name} has no 'output' block.\n"
@@ -936,7 +1052,7 @@ def main():
             "which the single-pipe design cannot express. Turn it off in the preset.")
     if stabilizing and not args.gyroflow.exists() and not args.dry_run:
         die(f"Gyroflow CLI not found at: {args.gyroflow}\n"
-            f"   Pass --gyroflow /path/to/Gyroflow.app/Contents/MacOS/gyroflow\n"
+            f"   Pass --gyroflow {GYROFLOW_EXAMPLE}\n"
             f"   ({len(stabilizing)} of {len(decisions)} clips carry motion data)")
 
     # Beside the footage by default: that drive is usually the roomy one, and it

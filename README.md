@@ -23,10 +23,14 @@ See [Clips with nothing to stabilize](#clips-with-nothing-to-stabilize-are-grade
 
 | Component | Requirement |
 |---|---|
-| macOS | Apple silicon or Intel |
+| OS | macOS (Apple silicon or Intel), or Windows 10/11 |
 | Python | 3.8 or newer — standard library only, nothing to `pip install` |
-| ffmpeg / ffprobe | any recent build with `lut3d` and VideoToolbox |
-| Gyroflow | **the direct download, not the Mac App Store build** (see below) |
+| ffmpeg / ffprobe | any recent build with `lut3d` |
+| Gyroflow | on macOS, **the direct download, not the Mac App Store build** (see below) |
+
+On Windows the script works with one difference: it renders through a temporary
+file rather than a pipe, so it needs about 100 GB of free space per clip on the
+work drive. See [Running on Windows](#running-on-windows).
 
 ---
 
@@ -113,6 +117,38 @@ Installed somewhere else? Pass `--gyroflow /path/to/Gyroflow.app/Contents/MacOS/
 ```sh
 chmod +x stabilize_and_grade.py
 ```
+
+---
+
+## Setup on Windows
+
+### 1. Python
+
+Install Python 3 from <https://www.python.org/downloads/windows/>, or run
+`winget install Python.Python.3.12`. Run the script with the `py` launcher
+instead of `./`:
+
+```powershell
+py stabilize_and_grade.py --src-dir "D:\Footage\Race Day" --dry-run
+```
+
+### 2. ffmpeg
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+Open a new terminal afterwards so `ffmpeg` and `ffprobe` are on your `PATH`.
+That build includes the NVIDIA, Intel and AMD hardware encoders; the script
+picks whichever one your GPU actually supports — see
+[GPU encoding](#gpu-encoding).
+
+### 3. Gyroflow
+
+Download the Windows build from <https://gyroflow.xyz> and unzip it to
+`C:\Program Files\Gyroflow`, which is where the script looks for `gyroflow.exe`
+by default (after checking `PATH`). Anywhere else works too — pass
+`--gyroflow "C:\path\to\Gyroflow\gyroflow.exe"`.
 
 ---
 
@@ -207,8 +243,8 @@ D="/Volumes/Footage/Race Day"
 | `--out-dir DIR` | where deliveries go (default: `<src-dir>/Stabilized`) |
 | `--preset FILE` | default: the only `.gyroflow` in `--src-dir` |
 | `--lut FILE` | default: the only `.cube` in `--src-dir` |
-| `--gyroflow PATH` | path to the Gyroflow CLI binary |
-| `--work DIR` | scratch for the pipe (default: `<src-dir>/.gyroflow-work`) |
+| `--gyroflow PATH` | path to the Gyroflow CLI binary (`gyroflow.exe` on Windows) |
+| `--work DIR` | scratch for the pipe or intermediate (default: `<src-dir>/.gyroflow-work`) |
 | `--prores VARIANT` | intermediate quality through the pipe (default: `4444`) |
 | `--suffix STR` | name tag for the graded file (default: `" Stabilized Graded"`) |
 | `--ungraded-suffix STR` | name tag for the ungraded file (default: `" Stabilized"`) |
@@ -216,7 +252,7 @@ D="/Volumes/Footage/Race Day"
 | `--no-ungraded` | skip the ungraded copy |
 | `--rec709` | tag the graded file plain Rec.709 instead of Rec.709-A, and keep H.264/H.265 in `.mp4` |
 | `--force-stabilize` | stabilize every clip, even where no motion data was found |
-| `--mode file` | write a real ProRes intermediate instead of piping (~100 GB/clip) |
+| `--mode file` | write a real ProRes intermediate instead of piping (~100 GB/clip); always on for Windows |
 | `--overwrite` | re-render files that already exist |
 | `--dry-run` | print the plan and exit |
 | `--verbose` | let Gyroflow's own log through to the terminal |
@@ -224,6 +260,39 @@ D="/Volumes/Footage/Race Day"
 ---
 
 ## Things worth knowing
+
+### Running on Windows
+
+Everything above applies, with these differences:
+
+- **The intermediate goes through a file.** The pipe is a POSIX FIFO, which
+  Windows does not have, so `--mode file` is the default there and `--mode pipe`
+  is refused. It is still a single lossy encode; the cost is ~100 GB of scratch
+  per clip on the work drive, deleted as soon as the clip is done.
+- **The GPU encoder is detected**, not assumed — see below.
+- **Deliveries are still Rec.709-A `.mov` files**, so they look right when they
+  reach a Mac. Windows players ignore the `gama` atom, so it costs nothing there.
+- **Sleep is held off** through Windows' own power request, in place of
+  `caffeinate`.
+
+### GPU encoding
+
+With *Use GPU* ticked in the preset, H.264/H.265 go to a hardware encoder:
+
+| Platform | Encoder |
+|---|---|
+| macOS | VideoToolbox |
+| Windows | the first that works of NVIDIA NVENC, Intel Quick Sync, AMD AMF |
+
+Every ffmpeg build for Windows lists all three, whatever GPU is fitted, so the
+script test-encodes a fraction of a second with each, in that order, using the
+exact settings of the real encode. That also catches a GPU that has the encoder
+but cannot do 10-bit HEVC, as NVIDIA cards older than the GTX 10 series cannot.
+The chosen encoder shows on the `-> ffmpeg:` line of the plan.
+
+If none work, the script warns and encodes in software (`libx265`/`libx264`),
+which gives the same file but is much slower. Unticking *Use GPU* in the preset
+goes straight to software.
 
 ### Where the files land
 
@@ -366,7 +435,7 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 "Heat 1 Stabilized Gr
 
 ### The work directory must support named pipes
 
-The default mode renders through a FIFO, which needs a real filesystem. APFS and
+The default mode on macOS renders through a FIFO, which needs a real filesystem. APFS and
 HFS+ are fine. **exFAT, FAT, and most network shares are not** — the script
 detects this up front and tells you. Either point `--work` at an APFS/HFS+
 location that Gyroflow can read, or fall back to `--mode file`.
@@ -379,7 +448,8 @@ full ProRes intermediate, roughly **100 GB per clip** — check free space first
 ### Sleep
 
 The script holds a `caffeinate` power assertion for the duration of the run, so
-the Mac will not idle-sleep partway through a long batch. The assertion is tied
+the Mac will not idle-sleep partway through a long batch (on Windows, the
+equivalent system power request). The assertion is tied
 to the process ID, so it is released even if the script is killed outright.
 
 Two limits: the assertion against system sleep only applies on AC power, and
@@ -396,7 +466,9 @@ Two limits: the assertion against system sleep only applies on AC power, and
 | `no .cube file in …` | LUT missing from `--src-dir`, or pass `--lut` explicitly. |
 | A clip was graded but not stabilized | Its telemetry had no sub-frame motion data — check the `stabilize:` line. `--force-stabilize` overrides. |
 | `cannot create a named pipe` | Work directory is on exFAT or a network share. Use `--work` or `--mode file`. |
-| `ffmpeg/ffprobe not on PATH` | `brew install ffmpeg`, and check Homebrew's shell setup ran. |
+| `ffmpeg/ffprobe not on PATH` | `brew install ffmpeg`, and check Homebrew's shell setup ran. On Windows, `winget install Gyan.FFmpeg` and open a new terminal. |
+| `no working GPU encoder` | No NVENC/Quick Sync/AMF available — update the GPU driver. It still works, in software. |
+| `--mode pipe needs a FIFO` | Windows has no FIFOs; drop `--mode pipe`. |
 | Two `.cube` or `.gyroflow` files found | It warns and uses the first; pass `--lut` / `--preset` to choose. |
 | Everything reports "exists, skipping" | Deliveries are already there. `--overwrite` to redo them. |
 
