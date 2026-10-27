@@ -30,6 +30,11 @@ Why a pipe works (verified against Gyroflow's source):
 --src-dir is required and holds the clips, the .gyroflow preset and the .cube
 LUT. Deliveries land in <src-dir>/Stabilized.
 
+A recording the camera split into several files is first joined back into one
+with mp4-merge, the tool behind Gyroflow's own merge: losslessly, motion data
+included. The parts are moved into <src-dir>/Split parts, and --merge-only does
+just this, so the merged files can be renamed before they are stabilized.
+
 Gyroflow is skipped per clip when it would have nothing to do. DJI keeps its
 telemetry in a "djmd" data track, and this measures how often orientation samples
 arrive there: an unstabilized camera like an O4 Pro air unit logs a couple of
@@ -46,10 +51,13 @@ Usage:
     ./stabilize_and_grade.py --src-dir DIR --dry-run          # the derived plan
     ./stabilize_and_grade.py --src-dir DIR --no-ungraded      # graded only
     ./stabilize_and_grade.py --src-dir DIR --force-stabilize  # stabilize regardless
+    ./stabilize_and_grade.py --src-dir DIR --merge-only       # join split recordings
     ./stabilize_and_grade.py --src-dir DIR --mode file        # on disk instead
 """
 
 import argparse
+import collections
+import datetime
 import functools
 import json
 import os
@@ -410,6 +418,254 @@ def decide_stabilize(src, args, fps):
     if rate is None or not fps:
         return True, rate
     return rate > MOTION_RATE_FACTOR * fps, rate
+
+
+# ----------------------------------------------------------- split recordings
+
+# Cameras split a long recording into files of just under 4 GB, the FAT32 limit.
+# Gyroflow joins them back with mp4-merge, losslessly and with every track --
+# the motion data included -- but only from its GUI: its CLI has no merge. So
+# this runs mp4-merge's own CLI, the same code Gyroflow's merge calls.
+#
+# Nothing links the parts of one recording, so they are told apart the way
+# mp4-merge itself tells its chapters from separate recordings: by the files'
+# creation times, in whole seconds. A camera stamps each part with its own start
+# (DJI) or every part with the recording's (GoPro), so a file continues the one
+# before it when it has the same time, or that time plus the earlier file's
+# duration to within 2 s. Separate recordings are further apart -- a camera has
+# to close one file and start the next -- and on top of that Gyroflow's own merge
+# check applies: the same picture size, frame rate and rotation.
+MERGE_TOLERANCE = 2
+
+# The parts are moved here once merged, so the folder holds each recording once
+# and the next run does not process it twice. Not deleted: that is for the user.
+PARTS_DIR = "Split parts"
+
+# What Gyroflow's GUI names a merged file
+MERGED_SUFFIX = "_joined"
+
+MERGE_RE = re.compile(r"Merging\.\.\. ([\d.]+)%")
+
+Part = collections.namedtuple("Part", "created duration picture")
+
+
+def probe_part(path):
+    """What tells one split recording's files apart: (creation time, duration,
+    picture). Raises ValueError saying why when ffprobe cannot tell.
+
+    Asks for whole sections rather than -show_entries with the rotation in it:
+    the name of the side-data section has not been the same in every ffprobe,
+    and one that does not know it fails the whole query.
+    """
+    run = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_streams", "-show_format", "-of", "json", str(path)],
+        capture_output=True, encoding="utf-8", errors="replace")
+    if run.returncode != 0:
+        raise ValueError(f"ffprobe failed: {run.stderr.strip() or f'exit {run.returncode}'}")
+    try:
+        probed = json.loads(run.stdout)
+        fmt = probed["format"]
+        stream = probed["streams"][0]
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        raise ValueError(f"unreadable ffprobe output ({e!r})")
+    stamp = (fmt.get("tags") or {}).get("creation_time")
+    if not stamp:
+        raise ValueError("no creation time")
+    try:
+        created = datetime.datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
+        duration = float(fmt["duration"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"unreadable creation time or duration ({stamp!r}, "
+                         f"{fmt.get('duration')!r})")
+    rotation = next((s["rotation"] for s in stream.get("side_data_list", [])
+                     if "rotation" in s),
+                    (stream.get("tags") or {}).get("rotate", 0))
+    picture = (stream.get("width"), stream.get("height"),
+               stream.get("r_frame_rate"), int(float(rotation)))
+    return Part(created.replace(tzinfo=datetime.timezone.utc).timestamp(),
+                duration, picture)
+
+
+def continues(a, b):
+    """Whether part b is the next file of the recording part a belongs to, and if
+    not, why not."""
+    if a is None or b is None:
+        return False, "could not be read"
+    if a.picture != b.picture:
+        return False, f"different picture: {a.picture} vs {b.picture}"
+    since = b.created - a.created
+    if since == 0 or abs(since - a.duration) <= MERGE_TOLERANCE:
+        return True, ""
+    return False, (f"starts {since:.0f} s after it, and it runs {a.duration:.1f} s "
+                   f"-- a gap of {since - a.duration:.1f} s")
+
+
+def split_recordings(files):
+    """files grouped into recordings, in order: a list of one file for most, of
+    several for a split recording. Only neighbours in name order can be parts of one
+    recording, as in Gyroflow, and camera names sort by time anyway.
+
+    Also returns, for each pair of neighbours that were not joined, why not.
+    """
+    groups, apart = [], []
+    prev = None
+    for f in files:
+        part = None
+        if f.is_file():
+            try:
+                part = probe_part(f)
+            except ValueError as e:
+                warn(f"cannot tell whether {f.name} is part of a split recording: {e}")
+        joined, why = continues(prev, part) if groups else (False, "")
+        if joined:
+            groups[-1].append(f)
+        else:
+            if groups:
+                apart.append(f"{groups[-1][-1].name} -> {f.name}: {why}")
+            groups.append([f])
+        prev = part
+    return groups, apart
+
+
+def find_mp4_merge(given):
+    """The mp4-merge CLI. Its releases carry the platform in the file name
+    (mp4_merge-mac-arm64, mp4_merge-windows64.exe), so one dropped beside this
+    script is found as downloaded, as well as one on PATH."""
+    if given:
+        return given if given.is_file() else None
+    found = shutil.which("mp4_merge")
+    if found:
+        return Path(found)
+    beside = sorted(f for f in Path(__file__).resolve().parent.glob("mp4_merge*")
+                    if f.is_file())
+    return beside[0] if beside else None
+
+
+def run_mp4_merge(mp4_merge, parts, target):
+    """Merge parts into target, drawing a progress bar. Returns (exit code, the
+    tool's output without its progress).
+
+    The merge goes to a hidden name and gets target's only once it succeeded. The
+    mp4-merge release (0.1.11) writes straight into its output, so an interrupted
+    merge would otherwise leave a truncated file under the name that later runs
+    take to mean "already merged".
+    """
+    partial = target.with_name(f".{target.name}.{RUN_ID}.partial")
+    cmd = [str(mp4_merge)] + [str(p) for p in parts] + ["--out", str(partial)]
+    tty = sys.stdout.isatty()
+    drew = False
+    output = []
+    # Its progress is "\rMerging... 12.34%" with no newline, which universal
+    # newlines still split into lines.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            encoding="utf-8", errors="replace")
+    try:
+        for line in proc.stdout:
+            m = MERGE_RE.search(line)
+            if not m:
+                if line.strip():
+                    output.append(line.strip())
+                continue
+            if tty:
+                draw_progress("merge ", float(m.group(1)), f"{len(parts)} parts")
+                drew = True
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+        if drew:
+            clear_progress()
+        if rc == 0:
+            os.replace(partial, target)
+        partial.unlink(missing_ok=True)
+    return rc, output
+
+
+def merge_split_recordings(files, args):
+    """Join each split recording among files into one file beside its parts, and
+    move the parts into PARTS_DIR. Returns (the files to process, each recording
+    once; the recordings that failed to merge).
+
+    A merged file that already exists is used as it is: run_mp4_merge only ever
+    gives it that name once it is complete.
+    """
+    groups, apart = split_recordings(files)
+    split = [g for g in groups if len(g) > 1]
+    if not split:
+        if args.merge_only:
+            info("no split recordings found")
+            for line in apart:
+                print(f"    {line}")
+        return files, []
+
+    mp4_merge = find_mp4_merge(args.mp4_merge)
+    if mp4_merge is None and not args.dry_run:
+        die(f"{len(split)} split recording(s) to merge, but the mp4_merge tool was not "
+            f"found.\n   Download it from https://github.com/gyroflow/mp4-merge/releases "
+            f"and put it beside\n   this script or on PATH, or pass --mp4-merge. "
+            f"--no-merge processes the parts one by one.")
+
+    result, failed = [], []
+    try:
+        for group in groups:
+            merged = merge_one(group, mp4_merge, args)
+            if merged is None:
+                failed.append(f"{group[0].stem}{MERGED_SUFFIX}{group[0].suffix}")
+            else:
+                result.append(merged)
+    except KeyboardInterrupt:
+        print()
+        warn("aborted by user")
+        sys.exit(130)
+    return result, failed
+
+
+def merge_one(group, mp4_merge, args):
+    """One recording of merge_split_recordings: the file that stands for it from
+    here on, or None when its merge failed."""
+    if len(group) == 1:
+        return group[0]
+    first = group[0]
+    target = first.with_name(f"{first.stem}{MERGED_SUFFIX}{first.suffix}")
+    print()
+    info(f"split recording, {len(group)} parts: {first.name} … {group[-1].name}")
+    info(f"  merged as:  {target.name}  (parts moved to {PARTS_DIR}/)")
+    if args.dry_run:
+        # Nothing is merged, so the rest of the plan is shown on the first part
+        return first
+
+    if target.exists():
+        info(f"already merged, using it: {target.name}")
+    else:
+        started = time.monotonic()
+        rc, output = run_mp4_merge(mp4_merge, group, target)
+        if rc != 0:
+            warn(f"merge failed (exit {rc}); its parts are left as they are")
+            for line in output[-20:]:
+                print(f"    mp4_merge| {line}", file=sys.stderr)
+            return None
+        info(f"merged in {fmt_duration(time.monotonic() - started)}")
+        # Dated like the recording rather than the merge, so it sorts among the
+        # footage. mp4-merge tries this too, but not on every platform.
+        stat = first.stat()
+        os.utime(target, (stat.st_atime, stat.st_mtime))
+
+    parts_dir = first.parent / PARTS_DIR
+    parts_dir.mkdir(exist_ok=True)
+    for part in group:
+        dest = parts_dir / part.name
+        if dest.exists():
+            warn(f"{PARTS_DIR}/{part.name} already exists; leaving {part.name} in place")
+            continue
+        try:
+            part.rename(dest)
+        except OSError as e:
+            warn(f"could not move {part.name} into {PARTS_DIR}/ ({e.strerror}); "
+                 f"move it out of the way before the next run")
+    return target
 
 
 # ------------------------------------------------------------ filter graph
@@ -949,6 +1205,18 @@ def main():
                         "directly. Use this if a camera logs its motion somewhere this "
                         "script cannot read, and clips are being graded without being "
                         "stabilized")
+    p.add_argument("--merge-only", action="store_true",
+                   help="merge split recordings and stop, so the merged files can be "
+                        "renamed before stabilizing. Needs no preset, LUT or Gyroflow")
+    p.add_argument("--no-merge", dest="merge", action="store_false",
+                   help="process the parts of a split recording one by one instead of "
+                        "merging them first. By default a recording the camera split "
+                        "into several files is joined into one with mp4-merge -- "
+                        "losslessly, motion data included -- and its parts are moved "
+                        f"into <src-dir>/{PARTS_DIR}")
+    p.add_argument("--mp4-merge", type=Path, default=None,
+                   help="the mp4_merge tool from github.com/gyroflow/mp4-merge "
+                        "(default: on PATH, or any mp4_merge* beside this script)")
     p.add_argument("--mode", default=None, choices=["pipe", "file"],
                    help="'file' writes a real ProRes intermediate (needs ~100 GB/clip). "
                         "Default: pipe, except on Windows, which has no FIFOs and "
@@ -987,7 +1255,7 @@ def main():
     # reader blocks forever on a writer that is not coming. Resolving the
     # command line once is cheaper than auditing every consumer of these paths.
     args.src_dir = args.src_dir.resolve()
-    for attr in ("out_dir", "preset", "lut", "gyroflow", "work"):
+    for attr in ("out_dir", "preset", "lut", "gyroflow", "work", "mp4_merge"):
         given = getattr(args, attr)
         if given is not None:
             setattr(args, attr, given.resolve())
@@ -995,6 +1263,30 @@ def main():
     # ---- preflight
     if not args.src_dir.is_dir():
         die(f"source directory not found: {args.src_dir}")
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        die("ffmpeg/ffprobe not on PATH")
+    if args.merge_only and not args.merge:
+        die("--merge-only and --no-merge together leave nothing to do.")
+
+    # ---- file list. -iname-style matching without duplicating on a
+    # case-insensitive volume, and without descending into subfolders -- which
+    # also keeps the parts of merged recordings, in PARTS_DIR, out of it.
+    if args.files:
+        files = [f if f.is_absolute() else args.src_dir / f for f in args.files]
+    else:
+        files = visible_files(args.src_dir, ".mp4")
+    if not files:
+        die(f"no .mp4 files found in {args.src_dir}")
+
+    # ---- merging needs none of what follows, so --merge-only stops here
+    if args.merge_only:
+        files, failed = merge_split_recordings(files, args)
+        if failed:
+            print()
+            for name in failed:
+                print(f"  failed: {name}")
+        sys.exit(1 if failed else 0)
+
     if args.preset is None:
         args.preset = find_one(args.src_dir, ".gyroflow", "--preset")
     if args.lut is None:
@@ -1003,8 +1295,6 @@ def main():
         die(f"preset not found: {args.preset}")
     if not args.lut.is_file():
         die(f"LUT not found: {args.lut}")
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        die("ffmpeg/ffprobe not on PATH")
     if args.ungraded and args.ungraded_suffix == args.suffix:
         die("--suffix and --ungraded-suffix are the same, so the two renders would "
             "land on one file. Change one, or pass --no-ungraded.")
@@ -1020,21 +1310,20 @@ def main():
         warn("'preserve_other_tracks' is set; the DJI metadata tracks cannot survive "
              "the pipe and will be dropped.")
 
+    # ---- split recordings, joined before anything looks at the clips: the
+    # merged file is what gets stabilized and named.
+    merge_failed = []
+    if args.merge:
+        files, merge_failed = merge_split_recordings(files, args)
+        if not files:
+            die("no clip left to process: every split recording failed to merge")
+
     # ---- output folder. Deliberately NOT the preset's output_folder: that
     # usually points at the footage itself, and deliveries landing beside the
     # sources get picked up as sources by the next run (the default file list is
     # every .mp4 in --src-dir), so each run re-stabilizes its own output.
     if args.out_dir is None:
         args.out_dir = args.src_dir / "Stabilized"
-
-    # ---- file list. -iname-style matching without duplicating on a
-    # case-insensitive volume, and without descending into subfolders.
-    if args.files:
-        files = [f if f.is_absolute() else args.src_dir / f for f in args.files]
-    else:
-        files = visible_files(args.src_dir, ".mp4")
-    if not files:
-        die(f"no .mp4 files found in {args.src_dir}")
 
     # ---- which clips Gyroflow actually has work to do on. Decided for the whole
     # batch up front: a run that needs Gyroflow then finds out it is missing now
@@ -1118,8 +1407,8 @@ def main():
     if not args.dry_run and prevent_sleep():
         info("idle sleep held off for the duration of this run")
 
-    counts = {"ok": 0, "failed": 0, "skipped": 0}
-    failed = []
+    counts = {"ok": 0, "failed": len(merge_failed), "skipped": 0}
+    failed = [f"{name} (merge)" for name in merge_failed]
     try:
         for src in files:
             if not src.is_file():

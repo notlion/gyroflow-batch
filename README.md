@@ -13,6 +13,11 @@ stabilized-but-ungraded copy of the log original.
 The source is decoded once, Gyroflow renders once, nothing is encoded twice, and
 no multi-hundred-gigabyte intermediate file ever touches the disk.
 
+Recordings the camera split into several files are joined back into one first,
+losslessly and with their motion data, using Gyroflow's own merge tool. You can
+also merge on its own and rename the results before stabilizing. See
+[Split recordings are merged first](#split-recordings-are-merged-first).
+
 Clips that have nothing to stabilize — gimballed drone footage, say — are
 detected and sent straight to the grade, skipping the Gyroflow half entirely.
 See [Clips with nothing to stabilize](#clips-with-nothing-to-stabilize-are-graded-directly).
@@ -27,6 +32,7 @@ See [Clips with nothing to stabilize](#clips-with-nothing-to-stabilize-are-grade
 | Python | 3.8 or newer — standard library only, nothing to `pip install` |
 | ffmpeg / ffprobe | any recent build with `lut3d` |
 | Gyroflow | on macOS, **the direct download, not the Mac App Store build** (see below) |
+| mp4_merge | only for recordings split into several files — Gyroflow's merge tool (see below) |
 
 On Windows the script works with one difference: it renders through a temporary
 file rather than a pipe, so it needs about 100 GB of free space per clip on the
@@ -112,7 +118,19 @@ ls /Applications/Gyroflow.app/Contents/MacOS/gyroflow
 
 Installed somewhere else? Pass `--gyroflow /path/to/Gyroflow.app/Contents/MacOS/gyroflow`.
 
-### 5. The script
+### 5. mp4_merge
+
+Only needed if your camera splits long recordings into several files. From
+<https://github.com/gyroflow/mp4-merge/releases> download `mp4_merge-mac-arm64`
+(Apple silicon) or `mp4_merge-mac64` (Intel) and put it next to the script. It
+is found there under its downloaded name. Then let it run:
+
+```sh
+chmod +x mp4_merge-mac-*
+xattr -d com.apple.quarantine mp4_merge-mac-*
+```
+
+### 6. The script
 
 ```sh
 chmod +x stabilize_and_grade.py
@@ -149,6 +167,12 @@ Download the Windows build from <https://gyroflow.xyz> and unzip it to
 `C:\Program Files\Gyroflow`, which is where the script looks for `gyroflow.exe`
 by default (after checking `PATH`). Anywhere else works too — pass
 `--gyroflow "C:\path\to\Gyroflow\gyroflow.exe"`.
+
+### 4. mp4_merge
+
+Only needed if your camera splits long recordings into several files. From
+<https://github.com/gyroflow/mp4-merge/releases> download
+`mp4_merge-windows64.exe` and put it next to the script.
 
 ---
 
@@ -231,6 +255,9 @@ D="/Volumes/Footage/Race Day"
 # stabilize everything, even clips detected as having no motion data
 ./stabilize_and_grade.py --src-dir "$D" --force-stabilize
 
+# only merge split recordings, so they can be renamed before stabilizing
+./stabilize_and_grade.py --src-dir "$D" --merge-only
+
 # no FIFO support on the volume? write a real intermediate instead
 ./stabilize_and_grade.py --src-dir "$D" --mode file
 ```
@@ -251,6 +278,9 @@ D="/Volumes/Footage/Race Day"
 | `--unstabilized-suffix STR` | name tag for a clip graded without stabilization (default: `" Graded"`) |
 | `--no-ungraded` | skip the ungraded copy |
 | `--rec709` | tag the graded file plain Rec.709 instead of Rec.709-A, and keep H.264/H.265 in `.mp4` |
+| `--merge-only` | merge split recordings and stop; needs no preset, LUT or Gyroflow |
+| `--no-merge` | process the parts of a split recording one by one |
+| `--mp4-merge PATH` | path to the mp4_merge tool (default: on `PATH`, or beside the script) |
 | `--force-stabilize` | stabilize every clip, even where no motion data was found |
 | `--mode file` | write a real ProRes intermediate instead of piping (~100 GB/clip); always on for Windows |
 | `--overwrite` | re-render files that already exist |
@@ -303,6 +333,56 @@ the footage itself, and deliveries sitting beside the sources get picked up as
 sources by the next run — so each run ends up re-stabilizing its own output,
 producing files like `Heat 1 Stabilized Graded Stabilized Graded.mp4` and growing
 the work list every time. Keeping deliveries in a subfolder avoids that entirely.
+
+### Split recordings are merged first
+
+Cameras split a long recording into files of just under 4 GB, the FAT32 limit
+of the SD card. Stabilized one by one, each part would get its own delivery and
+the smoothing would restart at every join. So the script joins each such
+recording back into one file before anything else.
+
+The merge is done by **mp4_merge**, the tool from the Gyroflow project that
+Gyroflow's own "join the files" prompt uses. Gyroflow's command line cannot
+merge, so the script runs that tool directly. It copies the data without
+re-encoding and keeps every track, the motion data included, so the joined
+file stabilizes as one clip.
+
+**How parts are recognised.** Nothing in the files links the parts of a
+recording, so the script uses the same rule as mp4_merge itself: a file
+continues the one before it when its creation time equals that file's, or
+equals that file's plus its duration to within 2 s. It also requires the same
+picture size, frame rate and rotation, which Gyroflow checks before merging
+too. Separate recordings are further apart than that: the camera has to close
+one file and start the next.
+
+```
+==> split recording, 3 parts: DJI_20261024203002_0044_D.MP4 … DJI_20261024203712_0046_D.MP4
+==>   merged as:  DJI_20261024203002_0044_D_joined.MP4  (parts moved to Split parts/)
+```
+
+**What happens to the files.** The merged file goes beside the parts, named
+after the first one with `_joined` (as Gyroflow names it). The parts are
+**moved, not deleted**, into a `Split parts` subfolder. That way the folder
+holds each recording once and the next run does not merge or stabilize it
+again. Delete `Split parts` yourself once you are happy with the merged files.
+The merge needs as much free space again as the parts take up.
+
+**Merging on its own.** To name recordings before stabilizing them:
+
+```sh
+./stabilize_and_grade.py --src-dir "$D" --merge-only    # merge, then stop
+# rename DJI_…_joined.MP4 to "Heat 1.MP4", and so on
+./stabilize_and_grade.py --src-dir "$D"                 # stabilize and grade
+```
+
+`--merge-only` needs no preset, LUT or Gyroflow, only ffmpeg and mp4_merge.
+Deliveries are named after the clip, so renaming first gives you
+`Heat 1 Stabilized Graded.mov` rather than a name built from the first part.
+
+A merge is written under a hidden temporary name and gets its real name only
+once it has finished. An interrupted or failed merge therefore leaves no
+half-written file behind, and its parts stay where they were. `--no-merge` turns
+merging off and processes every file on its own.
 
 ### Clips with nothing to stabilize are graded directly
 
@@ -465,6 +545,9 @@ Two limits: the assertion against system sleep only applies on AC power, and
 | `has no 'output' block` | Preset saved without the **Export settings** group ticked. |
 | `no .cube file in …` | LUT missing from `--src-dir`, or pass `--lut` explicitly. |
 | A clip was graded but not stabilized | Its telemetry had no sub-frame motion data — check the `stabilize:` line. `--force-stabilize` overrides. |
+| `the mp4_merge tool was not found` | Download it from the mp4-merge releases page and put it beside the script, or pass `--mp4-merge`. `--no-merge` skips merging. |
+| `merge failed` | The parts could not be joined, e.g. a part is damaged or from an unfinished recording. The parts are left as they were. |
+| A file stayed in the folder after merging | It was already in `Split parts`, so it was not moved over the other copy. Move it out of the way before the next run. |
 | `cannot create a named pipe` | Work directory is on exFAT or a network share. Use `--work` or `--mode file`. |
 | `ffmpeg/ffprobe not on PATH` | `brew install ffmpeg`, and check Homebrew's shell setup ran. On Windows, `winget install Gyan.FFmpeg` and open a new terminal. |
 | `no working GPU encoder` | No NVENC/Quick Sync/AMF available — update the GPU driver. It still works, in software. |
