@@ -133,16 +133,19 @@ AUDIO_ENCODER = {
 
 
 def container_ext(codec, rec709a=False):
+    """The delivery's extension, or None for a codec this does not deliver --
+    image sequences, which have no delivery encode to save, and anything newer
+    than the codecs translated in build_video_args."""
     if codec in ("ProRes", "DNxHD", "CineForm"):
         return ".mov"
-    if codec in ("EXR Sequence", "PNG Sequence"):
-        return None
-    # H.264/H.265 would default to .mp4, but the gama atom that makes a file
-    # Rec.709-A is a QuickTime box: ffmpeg refuses to write it into .mp4
-    # ("Not writing 'gama' atom. Format is not MOV."). Delivering them in .mov
-    # instead is what Resolve does for a QuickTime H.265 export -- same encode,
-    # same bitrate, and the hvc1/avc1 tag is already set either way.
-    return ".mov" if rec709a else ".mp4"
+    if codec in ("H.265/HEVC", "H.264/AVC"):
+        # They would default to .mp4, but the gama atom that makes a file
+        # Rec.709-A is a QuickTime box: ffmpeg refuses to write it into .mp4
+        # ("Not writing 'gama' atom. Format is not MOV."). Delivering them in .mov
+        # instead is what Resolve does for a QuickTime H.265 export -- same
+        # encode, same bitrate, and the hvc1/avc1 tag is already set either way.
+        return ".mov" if rec709a else ".mp4"
+    return None
 
 
 def hw_encoder_args(name):
@@ -228,11 +231,6 @@ def build_video_args(out, fps):
     elif codec == "CineForm":
         args += ["-c:v", "cfhd", "-pix_fmt", "yuv422p10le"]
 
-    else:
-        die(f"codec {codec!r} from the preset is not supported by this script.\n"
-            f"   Image sequences have no delivery encode to save -- render those "
-            f"straight from Gyroflow and apply the LUT afterwards.")
-
     # Bitrate only means something for the long-GOP codecs; the intra ones are
     # driven entirely by their profile.
     if codec in ("H.265/HEVC", "H.264/AVC"):
@@ -263,38 +261,70 @@ def build_audio_args(out, source_has_audio):
 
 # ------------------------------------------------------------------- probing
 
+Probe = collections.namedtuple(
+    "Probe", "fps has_audio seconds created picture telemetry error")
+
+
+@functools.lru_cache(maxsize=None)
 def probe(path):
-    """Return (fps, has_audio, seconds) for a source file."""
-    try:
-        raw = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type,r_frame_rate:format=duration",
-             "-of", "json", str(path)],
-            capture_output=True, encoding="utf-8", errors="replace", check=True).stdout
-        probed = json.loads(raw)
-        streams = probed.get("streams", [])
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return None, False, None
+    """Everything this needs to know about a file, from one ffprobe run:
 
-    try:
-        seconds = float(probed.get("format", {}).get("duration"))
-    except (TypeError, ValueError):        # missing, or the literal "N/A"
-        seconds = None
+      fps, has_audio, seconds  of the first video stream, and the file's duration
+      created                  creation time in seconds since the epoch
+      picture                  (width, height, frame rate, rotation)
+      telemetry                index of the DJI "djmd" track
+      error                    why ffprobe could not read the file
 
-    fps = None
-    has_audio = False
-    for s in streams:
-        if s.get("codec_type") == "audio":
-            has_audio = True
-        elif s.get("codec_type") == "video" and fps is None:
-            r = s.get("r_frame_rate", "0/0")
-            try:
-                num, den = r.split("/")
-                if float(den):
-                    fps = float(num) / float(den)
-            except ValueError:
-                pass
-    return fps, has_audio, seconds
+    Any of them None when the file does not say. Asks for whole sections rather
+    than -show_entries naming the rotation: the side-data section has not had the
+    same name in every ffprobe, and one that does not know it fails the query.
+    """
+    unknown = Probe(None, False, None, None, None, None, None)
+    run = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json",
+         str(path)],
+        capture_output=True, encoding="utf-8", errors="replace")
+    if run.returncode != 0:
+        return unknown._replace(
+            error=f"ffprobe failed: {run.stderr.strip() or f'exit {run.returncode}'}")
+    try:
+        probed = json.loads(run.stdout)
+    except json.JSONDecodeError as e:
+        return unknown._replace(error=f"unreadable ffprobe output ({e})")
+    streams = probed.get("streams", [])
+    fmt = probed.get("format", {})
+
+    def number(text):
+        try:
+            return float(text)
+        except (TypeError, ValueError):        # missing, or the literal "N/A"
+            return None
+
+    video = next((x for x in streams if x.get("codec_type") == "video"), {})
+    num, _, den = str(video.get("r_frame_rate", "")).partition("/")
+    fps = number(num) / number(den) if number(num) and number(den) else None
+
+    stamp = (fmt.get("tags") or {}).get("creation_time", "")
+    try:
+        created = datetime.datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        created = None
+
+    rotation = next((x["rotation"] for x in video.get("side_data_list", [])
+                     if "rotation" in x),
+                    (video.get("tags") or {}).get("rotate", 0))
+    picture = (video.get("width"), video.get("height"), video.get("r_frame_rate"),
+               int(number(rotation) or 0))
+    return Probe(
+        fps=fps,
+        has_audio=any(x.get("codec_type") == "audio" for x in streams),
+        seconds=number(fmt.get("duration")),
+        created=created,
+        picture=picture,
+        telemetry=next((x["index"] for x in streams
+                        if x.get("codec_tag_string") == "djmd"), None),
+        error=None)
 
 
 # -------------------------------------------- is there anything to stabilize?
@@ -388,16 +418,7 @@ def orientation_rate(src):
     running a render that was not needed costs time, skipping one that was
     silently ships unstabilized footage.
     """
-    try:
-        raw = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_tag_string",
-             "-of", "json", str(src)],
-            capture_output=True, encoding="utf-8", errors="replace", check=True).stdout
-        streams = json.loads(raw).get("streams", [])
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return None
-    index = next((s["index"] for s in streams
-                  if s.get("codec_tag_string") == "djmd"), None)
+    index = probe(src).telemetry
     if index is None:
         return None
 
@@ -414,10 +435,11 @@ def orientation_rate(src):
     return _count_quaternions(data) / MOTION_WINDOW
 
 
-def decide_stabilize(src, args, fps):
+def decide_stabilize(src, args):
     """(run Gyroflow?, the sample rate that decided it) for one clip."""
     if args.force_stabilize:
         return True, None
+    fps = probe(src).fps
     rate = orientation_rate(src)
     if rate is None or not fps:
         return True, rate
@@ -450,61 +472,18 @@ MERGED_SUFFIX = "_joined"
 
 MERGE_RE = re.compile(r"Merging\.\.\. ([\d.]+)%")
 
-Part = collections.namedtuple("Part", "created duration picture")
-
-
-def probe_part(path):
-    """What tells one split recording's files apart: (creation time, duration,
-    picture). None for a file with no creation time -- normal for one that did
-    not come straight off a camera, and never part of a split recording here.
-    Raises ValueError saying why when ffprobe cannot read the file.
-
-    Asks for whole sections rather than -show_entries with the rotation in it:
-    the name of the side-data section has not been the same in every ffprobe,
-    and one that does not know it fails the whole query.
-    """
-    run = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_streams", "-show_format", "-of", "json", str(path)],
-        capture_output=True, encoding="utf-8", errors="replace")
-    if run.returncode != 0:
-        raise ValueError(f"ffprobe failed: {run.stderr.strip() or f'exit {run.returncode}'}")
-    try:
-        probed = json.loads(run.stdout)
-        fmt = probed["format"]
-        stream = probed["streams"][0]
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        raise ValueError(f"unreadable ffprobe output ({e!r})")
-    stamp = (fmt.get("tags") or {}).get("creation_time")
-    if not stamp:
-        return None
-    try:
-        created = datetime.datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")
-        duration = float(fmt["duration"])
-    except (KeyError, TypeError, ValueError):
-        raise ValueError(f"unreadable creation time or duration ({stamp!r}, "
-                         f"{fmt.get('duration')!r})")
-    rotation = next((s["rotation"] for s in stream.get("side_data_list", [])
-                     if "rotation" in s),
-                    (stream.get("tags") or {}).get("rotate", 0))
-    picture = (stream.get("width"), stream.get("height"),
-               stream.get("r_frame_rate"), int(float(rotation)))
-    return Part(created.replace(tzinfo=datetime.timezone.utc).timestamp(),
-                duration, picture)
-
-
 def continues(a, b):
     """Whether part b is the next file of the recording part a belongs to, and if
     not, why not."""
-    if a is None or b is None:
+    if a.created is None or b.created is None or a.seconds is None:
         return False, "no creation time to go by, or could not be read"
     if a.picture != b.picture:
         return False, f"different picture: {a.picture} vs {b.picture}"
     since = b.created - a.created
-    if since == 0 or abs(since - a.duration) <= MERGE_TOLERANCE:
+    if since == 0 or abs(since - a.seconds) <= MERGE_TOLERANCE:
         return True, ""
-    return False, (f"starts {since:.0f} s after it, and it runs {a.duration:.1f} s "
-                   f"-- a gap of {since - a.duration:.1f} s")
+    return False, (f"starts {since:.0f} s after it, and it runs {a.seconds:.1f} s "
+                   f"-- a gap of {since - a.seconds:.1f} s")
 
 
 def split_recordings(files):
@@ -517,12 +496,9 @@ def split_recordings(files):
     groups, apart = [], []
     prev = None
     for f in files:
-        part = None
-        if f.is_file():
-            try:
-                part = probe_part(f)
-            except ValueError as e:
-                warn(f"cannot tell whether {f.name} is part of a split recording: {e}")
+        part = probe(f)
+        if part.error and f.is_file():
+            warn(f"cannot tell whether {f.name} is part of a split recording: {part.error}")
         joined, why = continues(prev, part) if groups else (False, "")
         if joined:
             groups[-1].append(f)
@@ -559,33 +535,19 @@ def run_mp4_merge(mp4_merge, parts, target):
     """
     partial = target.with_name(f".{target.name}.{RUN_ID}.partial")
     cmd = [str(mp4_merge)] + [str(p) for p in parts] + ["--out", str(partial)]
-    tty = sys.stdout.isatty()
-    drew = False
     output = []
+
     # Its progress is "\rMerging... 12.34%" with no newline, which universal
     # newlines still split into lines.
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            encoding="utf-8", errors="replace")
+    def progress(line):
+        m = MERGE_RE.search(line)
+        return ("merge ", float(m.group(1)), f"{len(parts)} parts") if m else None
+
     try:
-        for line in proc.stdout:
-            m = MERGE_RE.search(line)
-            if not m:
-                if line.strip():
-                    output.append(line.strip())
-                continue
-            if tty:
-                draw_progress("merge ", float(m.group(1)), f"{len(parts)} parts")
-                drew = True
-    except BaseException:
-        proc.kill()
-        raise
-    finally:
-        proc.stdout.close()
-        rc = proc.wait()
-        if drew:
-            clear_progress()
+        rc = run_with_progress(cmd, progress, output.append)
         if rc == 0:
             os.replace(partial, target)
+    finally:
         partial.unlink(missing_ok=True)
     return rc, output
 
@@ -716,47 +678,70 @@ def clear_progress():
     sys.stdout.flush()
 
 
+def run_with_progress(cmd, progress, keep=None, stderr=subprocess.STDOUT):
+    """Run cmd, drawing a progress bar from its output. Returns its exit code.
+
+    progress(line) reads one stripped line of the tool's stdout: it returns a
+    (label, percent, detail) to draw, None for a line to hand to keep, or False
+    for one to drop. The bar is drawn on a terminal only, so redirected output
+    stays clean. Interrupted, the tool is killed rather than left running: a
+    render or encode carrying on would write the files the caller cleans up.
+
+    A tool that cannot be started at all -- not executable (a download not yet
+    chmod +x), or built for another platform -- is reported to keep as a line of
+    its own, with exit code 127, as a shell would.
+    """
+    tty = sys.stdout.isatty()
+    drew = False
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr,
+                                encoding="utf-8", errors="replace")
+    except OSError as e:
+        if keep:
+            keep(f"could not start {cmd[0]}: {e.strerror}")
+        return 127
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            bar = progress(line)
+            if bar is None:
+                if keep:
+                    keep(line)
+            elif bar and tty:
+                draw_progress(*bar)
+                drew = True
+    except BaseException:
+        proc.kill()
+        raise
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+        if drew:
+            clear_progress()
+    return rc
+
+
+def gyroflow_progress(line):
+    if NOISE_RE.search(line):
+        return False
+    m = RENDER_RE.search(line)
+    if m:
+        cur, total, pct, eta = m.groups()
+        return ("render", float(pct), f"{cur}/{total} frames  ETA {fmt_duration(float(eta))}")
+    m = SYNC_RE.search(line)
+    if m:
+        return ("sync  ", float(m.group(1)), "")
+    return None
+
+
 def run_gyroflow(cmd, log_path, verbose):
     if verbose:
         return subprocess.run(cmd).returncode
-
-    tty = sys.stdout.isatty()
-    drew = False
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
-                                encoding="utf-8", errors="replace")
-        try:
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if not line or NOISE_RE.search(line):
-                    continue
-
-                m = RENDER_RE.search(line)
-                if m:
-                    cur, total, pct, eta = m.groups()
-                    if tty:
-                        draw_progress("render", float(pct),
-                                      f"{cur}/{total} frames  ETA {fmt_duration(float(eta))}")
-                        drew = True
-                    continue
-
-                m = SYNC_RE.search(line)
-                if m:
-                    if tty:
-                        draw_progress("sync  ", float(m.group(1)))
-                        drew = True
-                    continue
-
-                log.write(line + "\n")
-        finally:
-            proc.stdout.close()
-            rc = proc.wait()
-            if drew:
-                clear_progress()
-    return rc
+        return run_with_progress(cmd, gyroflow_progress,
+                                 lambda line: log.write(line + "\n"), stderr=log)
 
 
 # -progress emits plain key=value lines; out_time is the only one worth reading.
@@ -778,34 +763,21 @@ def run_ffmpeg(cmd, log_path, seconds):
     # Progress goes to stdout for us to read, which leaves stderr alone as the log.
     cmd = cmd[:1] + ["-progress", "pipe:1"] + cmd[1:]
     started = time.monotonic()
-    drew = False
+
+    def progress(line):
+        m = FF_TIME_RE.match(line)
+        if not m:
+            return False
+        hours, mins, secs = m.groups()
+        done = int(hours) * 3600 + int(mins) * 60 + float(secs)
+        detail = f"{fmt_duration(done)}/{fmt_duration(seconds)}"
+        if done > 0:
+            eta = (seconds - done) * (time.monotonic() - started) / done
+            detail += f"  ETA {fmt_duration(max(0, eta))}"
+        return ("grade ", min(100.0, done / seconds * 100), detail)
+
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
-                                encoding="utf-8", errors="replace")
-        try:
-            for line in proc.stdout:
-                m = FF_TIME_RE.match(line)
-                if not m:
-                    continue
-                hours, mins, secs = m.groups()
-                done = int(hours) * 3600 + int(mins) * 60 + float(secs)
-                detail = f"{fmt_duration(done)}/{fmt_duration(seconds)}"
-                if done > 0:
-                    eta = (seconds - done) * (time.monotonic() - started) / done
-                    detail += f"  ETA {fmt_duration(max(0, eta))}"
-                draw_progress("grade ", min(100.0, done / seconds * 100), detail)
-                drew = True
-        except BaseException:
-            # subprocess.run, which this replaced, kills its child on Ctrl-C. Keep
-            # that: an encode left running would rewrite the output we delete.
-            proc.kill()
-            raise
-        finally:
-            proc.stdout.close()
-            rc = proc.wait()
-            if drew:
-                clear_progress()
-    return rc
+        return run_with_progress(cmd, progress, stderr=log)
 
 
 def dump_log(path, label, limit=40):
@@ -1024,16 +996,31 @@ def place(rendered, target):
         shutil.move(str(rendered), str(target))
 
 
+def deliveries(src, stabilize, args, ext):
+    """What a clip is delivered as: (kind, path) for each file, "graded" through
+    the LUT and "plain" for the ungraded copy.
+
+    A clip that is not stabilized must not be named as though it were, and its
+    ungraded copy would be a plain transcode of the source. Without a LUT there
+    is only the ungraded copy.
+    """
+    out = []
+    if args.lut:
+        tag = args.suffix if stabilize else args.unstabilized_suffix
+        out.append(("graded", args.out_dir / f"{src.stem}{tag}{ext}"))
+    if args.ungraded and stabilize:
+        out.append(("plain", args.out_dir / f"{src.stem}{args.ungraded_suffix}{ext}"))
+    return out
+
+
 # ------------------------------------------------------------------- runner
 
 def run_one(src, args, out_block, inter_preset, work, decision):
     stem = src.stem
     codec = out_block.get("codec", "H.265/HEVC")
     ext = container_ext(codec, args.rec709a)
-    if ext is None:
-        die(f"codec {codec!r} writes an image sequence, which has no delivery "
-            f"encode to save. Render those straight from Gyroflow instead.")
-    fps, has_audio, seconds = probe(src)
+    clip = probe(src)
+    fps, has_audio, seconds = clip.fps, clip.has_audio, clip.seconds
     stabilize, rate = decision
     grade = args.lut is not None
     if not stabilize:
@@ -1048,15 +1035,7 @@ def run_one(src, args, out_block, inter_preset, work, decision):
              f"its end would leave nothing; skipping it")
         return "skipped"
 
-    # A clip that is not stabilized must not be named as though it were, and its
-    # ungraded copy would be a plain transcode of the source. Without a LUT there
-    # is only the ungraded copy.
-    targets = []
-    if grade:
-        targets.append(("graded", args.out_dir /
-                        f"{stem}{args.suffix if stabilize else args.unstabilized_suffix}{ext}"))
-    if args.ungraded and stabilize:
-        targets.append(("plain", args.out_dir / f"{stem}{args.ungraded_suffix}{ext}"))
+    targets = deliveries(src, stabilize, args, ext)
 
     # Each output is skipped on its own, so a run that only lost one of the two
     # re-renders just that one.
@@ -1173,7 +1152,7 @@ def run_one(src, args, out_block, inter_preset, work, decision):
             # source only when it was not stabilized: trims in the preset make its
             # render shorter, and the bar should reach 100% on the real thing.
             if ff_input != src:
-                _, _, seconds = probe(ff_input)
+                seconds = probe(ff_input).seconds
             ff_rc = run_ffmpeg(ffmpeg_cmd, fflog, seconds)
         else:
             os.mkfifo(gf_tmp)
@@ -1404,6 +1383,12 @@ def main():
 
     # Only the graded path goes through ffmpeg; without a LUT Gyroflow writes the
     # delivery itself and keeps the tracks as the preset says.
+    codec = out_block.get("codec", "H.265/HEVC")
+    if container_ext(codec) is None:
+        die(f"codec {codec!r} from the preset is not supported by this script.\n"
+            f"   Image sequences have no delivery encode to save -- render those "
+            f"straight from Gyroflow and apply the LUT afterwards.")
+
     if out_block.get("preserve_other_tracks") and args.lut:
         warn("'preserve_other_tracks' is set; the DJI metadata tracks cannot survive "
              "the pipe and will be dropped.")
@@ -1427,7 +1412,7 @@ def main():
     # batch up front: a run that needs Gyroflow then finds out it is missing now
     # rather than four clips in, and a folder of gimballed footage never asks for
     # it at all. Costs one telemetry read per clip, about a tenth of a second.
-    decisions = {src: decide_stabilize(src, args, probe(src)[0])
+    decisions = {src: decide_stabilize(src, args)
                  for src in files if src.is_file()}
     stabilizing = [src for src, (yes, _) in decisions.items() if yes]
 
@@ -1466,7 +1451,7 @@ def main():
 
     # ---- show the derived plan; this is the bit worth eyeballing. Everything
     # downstream of "stabilize" is decided per clip, so this shows the first one.
-    fps, _, _ = probe(files[0])
+    fps = probe(files[0]).fps
     stabilize, rate = decisions.get(files[0], (True, None))
     info(f"preset:       {args.preset.name}")
     grade = args.lut is not None
@@ -1506,16 +1491,13 @@ def main():
                               else "none — the LUT only, Gyroflow not run" if grade
                               else "none — nothing to stabilize or grade, clip skipped"))
     # Names for the first clip, which is what the rest are patterned on.
-    ext = container_ext(out_block.get("codec", "H.265/HEVC"), args.rec709a) or ""
+    ext = container_ext(codec, args.rec709a)
     info(f"output:       {args.out_dir}"
          + (f"  (first of {len(files)} clips shown)" if len(files) > 1 else ""))
-    info(f"  graded:     " + (f"{files[0].stem}"
-                              f"{args.suffix if stabilize else args.unstabilized_suffix}{ext}"
-                              if grade else "off (no --lut)"))
-    info(f"  ungraded:   " + (f"{files[0].stem}{args.ungraded_suffix}{ext}"
-                              if args.ungraded and stabilize
-                              else "off (not stabilized)" if not stabilize
-                              else "off (--no-ungraded)"))
+    names = {kind: path.name for kind, path in deliveries(files[0], stabilize, args, ext)}
+    info(f"  graded:     {names.get('graded', 'off (no --lut)')}")
+    info(f"  ungraded:   " + names.get("plain", "off (not stabilized)" if not stabilize
+                                               else "off (--no-ungraded)"))
 
     if not args.dry_run and prevent_sleep():
         info("idle sleep held off for the duration of this run")
