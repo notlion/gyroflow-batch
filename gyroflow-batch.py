@@ -1005,6 +1005,25 @@ def make_out_params(out, work, filename, prores_variant):
     return json.dumps(params)
 
 
+def make_delivery_params(out, work, filename):
+    """Gyroflow's -p JSON for rendering the delivery itself: the preset's own
+    export settings, aimed at the work directory. Where they would point the
+    render elsewhere -- an output_path, a forced extension -- they are dropped."""
+    params = {k: v for k, v in out.items() if k not in ("output_path", "output_extension")}
+    params["output_folder"] = folder_url(work)
+    params["output_filename"] = filename
+    return json.dumps(params)
+
+
+def place(rendered, target):
+    """Move a finished render onto its delivery name: a rename on one volume, a
+    copy across two. Replaces what is there, which --overwrite has allowed."""
+    try:
+        os.replace(rendered, target)
+    except OSError:
+        shutil.move(str(rendered), str(target))
+
+
 # ------------------------------------------------------------------- runner
 
 def run_one(src, args, out_block, inter_preset, work, decision):
@@ -1049,6 +1068,15 @@ def run_one(src, args, out_block, inter_preset, work, decision):
     if not targets:
         return "skipped"
 
+    # Without a LUT a stabilized clip has a single delivery and nothing left to do
+    # to it after Gyroflow, so Gyroflow writes it itself with the preset's own
+    # export settings. That is still the one lossy encode, but without the
+    # ProRes intermediate, the pipe (or ~100 GB file), or ffmpeg decoding and
+    # re-encoding it. Gyroflow carries the source's colour tags over to its
+    # output -- the plain Rec.709 the ungraded copy gets anyway -- and tags H.265
+    # hvc1 itself.
+    direct = stabilize and not grade
+
     want_audio = has_audio and bool(out_block.get("audio", True))
     comment = (out_block.get("metadata") or {}).get("comment", "")
 
@@ -1057,7 +1085,7 @@ def run_one(src, args, out_block, inter_preset, work, decision):
         + ["-i", None]                      # filled in below
         + ["-filter_complex", build_filter_complex(args.lut, [k for k, _ in targets])]
     )
-    for kind, path in targets:
+    for kind, path in ([] if direct else targets):
         ffmpeg_cmd += ["-map", f"[{kind}]"]
         ffmpeg_cmd += ["-map", "0:a:0"] if want_audio else []
         ffmpeg_cmd += build_video_args(out_block, fps)
@@ -1081,7 +1109,13 @@ def run_one(src, args, out_block, inter_preset, work, decision):
     # finished, so both names have to be tracked in both modes. Miss the .tmp and
     # an interrupted --mode file run strands a full-size intermediate -- upwards
     # of 100 GB per clip that nothing else will ever clean up.
-    gf_filename = f"{stem}.{RUN_ID}." + ("mov" if args.mode == "file" else "mkv")
+    #
+    # The name goes to Gyroflow inside -p, whose parser turns every ' into " before
+    # reading the JSON, so a clip named "Ryan's Heat" would break it: quotes are
+    # left out. A direct render is moved onto its delivery name once finished.
+    safe_stem = re.sub(r"['\"]", "_", stem)
+    gf_ext = ext[1:] if direct else "mov" if args.mode == "file" else "mkv"
+    gf_filename = f"{safe_stem}.{RUN_ID}.{gf_ext}"
     gf_final = work / gf_filename
     gf_tmp = work / f"{gf_filename}.tmp"
 
@@ -1091,7 +1125,8 @@ def run_one(src, args, out_block, inter_preset, work, decision):
     ff_input = src if not stabilize else gf_final if args.mode == "file" else gf_tmp
     ffmpeg_cmd[ffmpeg_cmd.index(None)] = str(ff_input)
 
-    out_params = make_out_params(out_block, work, gf_filename, args.prores)
+    out_params = (make_delivery_params(out_block, work, gf_filename) if direct
+                  else make_out_params(out_block, work, gf_filename, args.prores))
     # --stdout-progress gives us parseable progress lines. Its own bar would fight
     # with them on the same stream, but we consume stdout and discard the bar.
     gf_cmd = [str(args.gyroflow), str(src), "--preset", str(inter_preset),
@@ -1100,7 +1135,10 @@ def run_one(src, args, out_block, inter_preset, work, decision):
     if args.dry_run:
         if stabilize:
             print(f"  gyroflow: {shlex.join(gf_cmd)}")
-        print(f"  ffmpeg:   {shlex.join(ffmpeg_cmd)}")
+        if direct:
+            print(f"  then:     move {gf_final.name} to {targets[0][1]}")
+        else:
+            print(f"  ffmpeg:   {shlex.join(ffmpeg_cmd)}")
         return "skipped"
 
     for leftover in (gf_tmp, gf_final):
@@ -1111,6 +1149,17 @@ def run_one(src, args, out_block, inter_preset, work, decision):
     ff = None
     started = time.monotonic()
     try:
+        if direct:
+            gf_rc = run_gyroflow(gf_cmd, gflog, args.verbose)
+            if gf_rc != 0:
+                warn(f"gyroflow failed on {src.name} (exit {gf_rc})")
+                dump_log(gflog, "gyroflow")
+                gyroflow_failure_hint(gf_rc)
+                return "failed"
+            place(gf_final, targets[0][1])
+            info(f"done in {fmt_duration(time.monotonic() - started)}: {targets[0][1].name}")
+            return "ok"
+
         if not stabilize or args.mode == "file":
             # A clip we are not stabilizing is this branch with the render already
             # sitting there: ffmpeg reads a finished file either way.
@@ -1353,7 +1402,9 @@ def main():
             f"   Re-save the preset from Gyroflow with the \"Export settings\" group\n"
             f"   ticked — this script reads your delivery settings from it.")
 
-    if out_block.get("preserve_other_tracks"):
+    # Only the graded path goes through ffmpeg; without a LUT Gyroflow writes the
+    # delivery itself and keeps the tracks as the preset says.
+    if out_block.get("preserve_other_tracks") and args.lut:
         warn("'preserve_other_tracks' is set; the DJI metadata tracks cannot survive "
              "the pipe and will be dropped.")
 
@@ -1403,7 +1454,8 @@ def main():
     if stabilizing and ("'" in str(args.work) or '"' in str(args.work)):
         die("the work directory path must not contain quotes or apostrophes")
     if not args.dry_run:
-        if args.mode == "pipe" and stabilizing:
+        # Without a LUT nothing goes through the pipe
+        if args.mode == "pipe" and stabilizing and args.lut:
             check_fifo_support(args.work)
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1435,17 +1487,22 @@ def main():
     # out of the picture the frames arrive at whatever size the camera wrote.
     size = (f"{out_block.get('output_width')}x{out_block.get('output_height')}"
             if stabilize else "source size")
+    direct = stabilize and not grade
     info(f"final encode: {out_block.get('codec')} "
          f"{out_block.get('codec_options') or ''} @ {out_block.get('bitrate', 0):.2f} Mbps, "
          f"{size}, gpu={out_block.get('use_gpu')}")
-    info(f"  -> ffmpeg:  {shlex.join(build_video_args(out_block, fps))}")
+    if direct:
+        info(f"  -> by Gyroflow itself, from the preset's export settings")
+    else:
+        info(f"  -> ffmpeg:  {shlex.join(build_video_args(out_block, fps))}")
     info(f"  -> color:   " + ("Rec.709, ungraded" if not grade else
                               "Rec.709 (--rec709)" if not args.rec709a else
                               "graded Rec.709-A (gama 1.96)"
                               + (", ungraded Rec.709" if args.ungraded and stabilize else "")))
     if args.trim_end:
         info(f"trim:         last {args.trim_end:g} s of every stabilized clip")
-    info(f"intermediate: " + (f"ProRes {args.prores} through a {args.mode}" if stabilize
+    info(f"intermediate: " + ("none — no LUT, so Gyroflow writes the delivery itself" if direct
+                              else f"ProRes {args.prores} through a {args.mode}" if stabilize
                               else "none — the LUT only, Gyroflow not run" if grade
                               else "none — nothing to stabilize or grade, clip skipped"))
     # Names for the first clip, which is what the rest are patterned on.

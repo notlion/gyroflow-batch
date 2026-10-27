@@ -9,8 +9,12 @@ bitrate, size, audio, keyframe distance) drive the final ffmpeg encode, while a
 derived copy sends Gyroflow's render into a named pipe as ProRes. One ffmpeg
 reads that pipe once and writes the deliveries. With `--lut` there are two: the
 graded one through the 3D LUT, and a stabilized-but-ungraded copy of the log
-original. Without `--lut` nothing is graded and only the stabilized copy is
-written.
+original.
+
+Without `--lut` there is nothing for ffmpeg to do, so it is left out: Gyroflow
+renders the stabilized delivery itself, straight from the preset's export
+settings, with no ProRes intermediate and no pipe. See
+[Without a LUT, Gyroflow writes the delivery](#without-a-lut-gyroflow-writes-the-delivery).
 
 The source is decoded once, Gyroflow renders once, nothing is encoded twice, and
 no multi-hundred-gigabyte intermediate file ever touches the disk.
@@ -36,9 +40,9 @@ See [Clips with nothing to stabilize](#clips-with-nothing-to-stabilize-are-grade
 | Gyroflow | on macOS, **the direct download, not the Mac App Store build** (see below) |
 | mp4_merge | only for recordings split into several files — Gyroflow's merge tool (see below) |
 
-On Windows Gyroflow Batch works with one difference: it renders through a
-temporary file rather than a pipe, so it needs about 100 GB of free space per
-clip on the work drive. See [Running on Windows](#running-on-windows).
+On Windows Gyroflow Batch works with one difference: when grading, it renders
+through a temporary file rather than a pipe, so it needs about 100 GB of free
+space per clip on the work drive. See [Running on Windows](#running-on-windows).
 
 ---
 
@@ -310,10 +314,11 @@ LUT=~/LUTs/DLogM-to-709.cube
 
 Everything above applies, with these differences:
 
-- **The intermediate goes through a file.** The pipe is a POSIX FIFO, which
-  Windows does not have, so `--mode file` is the default there and `--mode pipe`
-  is refused. It is still a single lossy encode; the cost is ~100 GB of scratch
-  per clip on the work drive, deleted as soon as the clip is done.
+- **When grading, the intermediate goes through a file.** The pipe is a POSIX
+  FIFO, which Windows does not have, so `--mode file` is the default there and
+  `--mode pipe` is refused. It is still a single lossy encode; the cost is
+  ~100 GB of scratch per clip on the work drive, deleted as soon as the clip is
+  done. Without `--lut` there is no intermediate at all, so none of this applies.
 - **The GPU encoder is detected**, not assumed — see below.
 - **Deliveries are still Rec.709-A `.mov` files**, so they look right when they
   reach a Mac. Windows players ignore the `gama` atom, so it costs nothing there.
@@ -481,6 +486,28 @@ at all, the work directory holds nothing but the ffmpeg log so it does not need
 to support FIFOs, and `export trims separately` in the preset stops being an
 error — all three are Gyroflow's concerns only.
 
+### Without a LUT, Gyroflow writes the delivery
+
+The ffmpeg half exists to grade, and to write two deliveries from one render.
+Without `--lut` neither is needed: a stabilized clip has a single, ungraded
+delivery. So Gyroflow renders that delivery itself, with the codec, bitrate,
+size and audio from the preset's export settings, as it would from its own GUI.
+The ProRes intermediate, the pipe (or the ~100 GB file of `--mode file`), and
+ffmpeg decoding and re-encoding it are all skipped. It is still one lossy encode.
+
+The result matches what the ffmpeg path wrote. Gyroflow carries the source's
+colour tags over to its output, which is the plain Rec.709 the ungraded copy
+gets anyway, and tags H.265 `hvc1` for QuickTime. Gyroflow renders under a
+temporary name in the work directory, and the file is moved into `Stabilized`
+only once it is complete.
+
+Two smaller differences follow from Gyroflow doing the encode:
+
+- Its own GPU encoder is used, so the `-> ffmpeg:` line and the encoder
+  detection described under [GPU encoding](#gpu-encoding) do not apply.
+- `preserve_other_tracks` in the preset works: Gyroflow keeps the DJI metadata
+  tracks that the pipe would drop.
+
 ### Progress
 
 Pipe mode shows one bar: Gyroflow is the slow half, and the encoder keeps pace
@@ -556,15 +583,17 @@ ffprobe -v error -show_entries format=duration -of csv=p=0 "Heat 1 Stabilized Gr
 
 ### The work directory must support named pipes
 
-The default mode on macOS renders through a FIFO, which needs a real filesystem.
-APFS and HFS+ are fine. **exFAT, FAT, and most network shares are not** —
-Gyroflow Batch detects this up front and tells you. Either point `--work` at an
-APFS/HFS+ location that Gyroflow can read, or fall back to `--mode file`.
+When grading, the default mode on macOS renders through a FIFO, which needs a
+real filesystem. APFS and HFS+ are fine. **exFAT, FAT, and most network shares
+are not** — Gyroflow Batch detects this up front and tells you. Either point
+`--work` at an APFS/HFS+ location that Gyroflow can read, or fall back to
+`--mode file`. Without `--lut` there is no pipe, so any filesystem will do.
 
 ### Disk space
 
-Pipe mode writes only the two deliveries. `--mode file` additionally writes a
-full ProRes intermediate, roughly **100 GB per clip** — check free space first.
+Pipe mode writes only the deliveries, and so does a run without `--lut`.
+`--mode file` with `--lut` additionally writes a full ProRes intermediate,
+roughly **100 GB per clip** — check free space first.
 
 ### Sleep
 
